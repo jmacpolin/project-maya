@@ -751,10 +751,19 @@ def read_json(path: Path) -> dict:
         return {}
 
 
+def config_dir() -> Path:
+    """Where Maya keeps its configs (maya-*.json) and what goes with them - each one's log and start script, the
+    dashboard's settings beside it, the setup's log, --bench's and --report's files: this folder, or MAYA_CONFIG_DIR -
+    for a Maya folder that is read-only or replaced as a whole (a container image), with the configs on a volume of
+    their own."""
+    d = os.environ.get("MAYA_CONFIG_DIR")
+    return Path(d).expanduser().resolve() if d else ROOT
+
+
 def configs() -> list:
     """The installed models' configs, the most recently used first - not the dashboard's settings the server keeps
     beside each (<config>.shared-settings.json), which a restart took for a config of the CUDA backend."""
-    return sorted((p for p in ROOT.glob("maya-*.json") if not p.name.endswith(".shared-settings.json")),
+    return sorted((p for p in config_dir().glob("maya-*.json") if not p.name.endswith(".shared-settings.json")),
                   key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -1136,6 +1145,69 @@ def vs_2026(vcvars) -> bool:
     return vcvars is not None and any(p.isdigit() and 18 <= int(p) < 1000 for p in PureWindowsPath(str(vcvars)).parts)
 
 
+def linux_rocm() -> Path:
+    """The ROCm the HIP engine is compiled with on Linux - ROCM_PATH, else /opt/rocm, else the newest /opt/rocm-X.Y.Z,
+    else a distribution's own packages under /usr - checked for its compiler, hipBLAS and a C++ compiler (ROCm 7;
+    6.x only with MAYA_HIP_ALLOW_ROCM6=1)."""
+    root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
+    if not os.environ.get("ROCM_PATH") and not root.exists():
+        # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
+        versions = sorted(Path("/opt").glob("rocm-[0-9]*"),
+                          key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
+        if versions:
+            root = versions[-1]
+        elif (Path("/usr/bin/hipcc").exists() and hip_clang(Path("/usr")) is not None):
+            root = Path("/usr")   # a distribution's own ROCm packages (Fedora's: /usr/lib64/rocm/llvm, lib64)
+    root = root.resolve()
+    clang = hip_clang(root)
+    if (clang is None or clang.parent == root / "bin"
+            or not any(list((root / d).glob("libhipblas.so*"))
+                       for d in ("lib", "lib64", *(q.relative_to(root) for q in (root / "lib").glob("*-linux-gnu"))))):
+        fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
+    if tool_version(str(root / "bin/hipcc")) < (7, 0):
+        if os.environ.get("MAYA_HIP_ALLOW_ROCM6") != "1":
+            fail("Maya's HIP port requires ROCm 7 or newer",
+                 "or set MAYA_HIP_ALLOW_ROCM6=1 to try a ROCm 6.x (untested, e.g. a distribution's packages)")
+        warn("ROCm older than 7 (MAYA_HIP_ALLOW_ROCM6=1): untested, the build or the engine may fail")
+    if not shutil.which("c++"):
+        fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+    return root
+
+
+def hip_build_pc(a) -> dict:
+    """--hip-archs: what check_hip_pc gives a build, for these architectures instead of the GPUs found here - none
+    needed (a container image's build; its maya.py --setup later finds the engines compiled for the cards it sees)."""
+    if WIN or not sys.platform.startswith("linux"):
+        fail("--hip-archs builds on Linux (on Windows the setup compiles for the GPUs it finds)")
+    archs = sorted({x.strip() for x in str(a.hip_archs).split(",") if x.strip()})
+    known = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    bad = [x for x in archs if x not in known]
+    if not archs or bad:
+        fail(f"--hip-archs {a.hip_archs}: Maya's HIP build takes {', '.join(known)}")
+    root = linux_rocm()
+    ok(f"compiling for {', '.join(archs)} (--hip-archs, no GPU needed); ROCm: {root}")
+    select_build_backend("hip")
+    return {"backend": "hip", "gpus": [], "archs": archs, "rocm": str(root)}
+
+
+BUILD_ONLY_TARGETS = ("maya", "maya-ds4", "maya-mm3")   # GLM-5.3-Flash and Qwen's, DeepSeek's, MiniMax's
+
+
+def build_only(a) -> int:
+    """--build-only: steps 3 and 4 alone - the Python packages, llama.cpp's source and every engine (maya: GLM-5.3-Flash
+    and Qwen; maya-ds4: DeepSeek; maya-mm3: MiniMax) - then exit: no model and no config.  HIP: for the GPUs found
+    here, or with --hip-archs for those architectures on a machine without them."""
+    if a.backend != "hip":
+        fail("--build-only compiles the HIP engine: --backend hip (with --hip-archs gfx1030 on a machine without the "
+             f"cards); for NVIDIA run {ME} --setup")
+    pc = hip_build_pc(a) if a.hip_archs else check_hip_pc(a)
+    llama = tools_step(a)
+    for target in BUILD_ONLY_TARGETS:
+        build_step(a, pc, llama, target=target)
+    ok(f"built: {', '.join(str(exe_for_target(t)) for t in BUILD_ONLY_TARGETS)} ({', '.join(pc['archs'])})")
+    return 0
+
+
 def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's HIP backend runs on native Linux or Windows")
@@ -1204,28 +1276,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         if hipcc is not None and tool_version(str(hipcc)) < (7, 0):
             fail("Maya's HIP port requires ROCm 7 or newer")
     else:
-        root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
-        if not os.environ.get("ROCM_PATH") and not root.exists():
-            # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
-            versions = sorted(Path("/opt").glob("rocm-[0-9]*"),
-                              key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
-            if versions:
-                root = versions[-1]
-            elif (Path("/usr/bin/hipcc").exists() and hip_clang(Path("/usr")) is not None):
-                root = Path("/usr")   # a distribution's own ROCm packages (Fedora's: /usr/lib64/rocm/llvm, lib64)
-        root = root.resolve()
-        clang = hip_clang(root)
-        if (clang is None or clang.parent == root / "bin"
-                or not any(list((root / d).glob("libhipblas.so*"))
-                           for d in ("lib", "lib64", *(q.relative_to(root) for q in (root / "lib").glob("*-linux-gnu"))))):
-            fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
-        if tool_version(str(root / "bin/hipcc")) < (7, 0):
-            if os.environ.get("MAYA_HIP_ALLOW_ROCM6") != "1":
-                fail("Maya's HIP port requires ROCm 7 or newer",
-                     "or set MAYA_HIP_ALLOW_ROCM6=1 to try a ROCm 6.x (untested, e.g. a distribution's packages)")
-            warn("ROCm older than 7 (MAYA_HIP_ALLOW_ROCM6=1): untested, the build or the engine may fail")
-        if not shutil.which("c++"):
-            fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+        root = linux_rocm()
     cpu, avx2, avx512 = S.cpu_info()
     if not avx2:
         # as on CUDA (#32): the CPU expert lane falls back to ggml's own kernels (src/kernels/cpu/expert_layout.cpp)
@@ -3232,11 +3283,11 @@ def write_run_script(cfg_path: Path, port: int) -> Path:
     dashboard), else (--plain, or no terminal: a service) the server's text as it prints."""
     cmd = [sys.executable, str(HERE / "maya.py"), "--config", str(cfg_path), "--port", str(port)]
     if WIN:
-        script = ROOT / f"run-{cfg_path.stem}.bat"
+        script = cfg_path.parent / f"run-{cfg_path.stem}.bat"
         script.write_text(f'@echo off\r\nrem starts the Project Maya dashboard and API (written by maya.py; {ME} does '
                           f'the same)\r\ncd /d "{ROOT}" || exit /b 1\r\n{cmdline(cmd)} %*\r\n', encoding="utf-8")
         return script
-    script = ROOT / f"run-{cfg_path.stem}.sh"
+    script = cfg_path.parent / f"run-{cfg_path.stem}.sh"
     script.write_text("#!/bin/sh\n# starts the Project Maya dashboard and API (written by maya.py; ./maya.sh does the "
                       "same)\ncd " + shlex.quote(str(ROOT)) + " || exit 1\nexec " + shlex.join(cmd) + ' "$@"\n',
                       encoding="utf-8")
@@ -3372,7 +3423,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if env:
         cfg["env"] = env
     suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
-    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
+    cfg_path = config_dir() / f"maya-{quant.lower()}{suffix}.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
@@ -4456,9 +4508,9 @@ def after_server(rc: int, a) -> int:
     backend, config = a.backend, getattr(a, "config", None)
     # the Models page: another model to start (a switch), or this one with its new engine settings - the server's
     # note says which config, on the port it listened on (so the page finds it again)
-    note = read_json(ROOT / SWITCH_FILE) if rc == RESTART_EXIT else {}
+    note = read_json(config_dir() / SWITCH_FILE) if rc == RESTART_EXIT else {}
     try:
-        (ROOT / SWITCH_FILE).unlink()
+        (config_dir() / SWITCH_FILE).unlink()
     except OSError:
         pass
     why = None
@@ -4572,8 +4624,9 @@ def rocm_report(rocm: Path) -> str:
 
 
 def report(version: str, backend: str | None = None, cfg_path: Path | None = None) -> int:
-    """--report: maya-report.txt in the Maya folder - this PC, the installed setup and the engine log's speed lines,
-    for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are left out."""
+    """--report: maya-report.txt beside the configs (config_dir()) - this PC, the installed setup and the engine log's
+    speed lines, for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are
+    left out."""
     home = str(Path.home())
     lines = []
     have = [cfg_path] if cfg_path is not None else configs()
@@ -4653,10 +4706,10 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             add(f"Engine log {log.name}: the last 25 lines", "\n".join(text[-25:]))
         else:
             add(f"Engine log {log.name}", "not written yet (start Maya once and ask it something)")
-    bench_txt = ROOT / "maya-bench.txt"
+    bench_txt = config_dir() / "maya-bench.txt"
     if bench_txt.exists():
         add("Benchmark (maya-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
-    out = ROOT / "maya-report.txt"
+    out = config_dir() / "maya-report.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
     ok(f"written: {out}")
@@ -4757,7 +4810,7 @@ def bench(cfg_path: Path, version: str) -> int:
                        sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
     doc = tok.encode(text)
     lens = [n for n in (2048, 8192) if n + 64 <= ctx and n <= len(doc)]
-    log_path = ROOT / "maya-bench.log"
+    log_path = config_dir() / "maya-bench.log"
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
     with open(log_path, "w", encoding="utf-8") as log, thermal_watch(cfg):
@@ -4829,7 +4882,7 @@ def bench(cfg_path: Path, version: str) -> int:
               for r in results if r[0] == "decode"]
     lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
     lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
-    out = ROOT / "maya-bench.txt"
+    out = config_dir() / "maya-bench.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
     for x in lines[:4 + len(results)]:
@@ -5813,7 +5866,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
+    cfg_path = config_dir() / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     old = read_json(cfg_path)
     # --tp is the tensor-parallel group: two equal GPUs per group (a GPU without an equal neighbour runs
     # its layers alone).  On one GPU that group must be the GPU itself: with --tp 2 the prompt path falls
@@ -6383,10 +6437,11 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     port = a.port or 8080
     hip = pc.get("backend") == "hip"   # (AMD: a GGUF quant - a config of its own, as DeepSeek's)
     suffix = "-hip" if hip else ""
-    legacy = ROOT / f"maya-mm3{suffix}.json"
-    cfg_path = ROOT / f"{Q.config_stem('minimax', quant) or 'maya-mm3'}{suffix}.json"
+    legacy = config_dir() / f"maya-mm3{suffix}.json"
+    cfg_path = config_dir() / f"{Q.config_stem('minimax', quant) or 'maya-mm3'}{suffix}.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     if own:   # (a folder of your own: a config of its own, named after the folder - the pinned quant's stays as it is)
-        cfg_path = ROOT / f"maya-{re.sub(r'[^a-z0-9._-]+', '-', d.name.lower()).strip('-') or 'mm3-own'}{suffix}.json"
+        cfg_path = config_dir() / f"maya-{re.sub(r'[^a-z0-9._-]+', '-', d.name.lower()).strip('-') or 'mm3-own'}{suffix}.json"
     old = read_json(cfg_path) if cfg_path.exists() else {} if own else read_json(legacy)
     moved = not own and cfg_path != legacy and (old.get("installer") or {}).get("mm3_quant") == quant and \
         not cfg_path.exists()
@@ -6478,7 +6533,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         shared = legacy.with_suffix(".shared-settings.json")
         if shared.exists() and not cfg_path.with_suffix(".shared-settings.json").exists():
             shared.replace(cfg_path.with_suffix(".shared-settings.json"))
-        for p in (legacy, ROOT / f"run-{legacy.stem}.{'bat' if WIN else 'sh'}"):
+        for p in (legacy, legacy.parent / f"run-{legacy.stem}.{'bat' if WIN else 'sh'}"):
             p.unlink(missing_ok=True)
         ok(f"{legacy.name} (this quant's config before) is now {cfg_path.name}")
     if MM3_PROFILE.exists():
@@ -6738,7 +6793,8 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / f"{Q.config_stem('qwen', quant)}{'-hip' if hip else ''}.json"
+    cfg_path = config_dir() / f"{Q.config_stem('qwen', quant)}{'-hip' if hip else ''}.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     old = read_json(cfg_path)
     profile = pack / "expert-profile.bin"
     # the Qwen path: the pack, the model file for its native weights and its n-gram table, decode windows of up to 4
@@ -6850,7 +6906,7 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
     say()
     say("  Measuring the MTP drafter on this PC: the same answer written with and without it (the model loads twice,")
     say("  a few minutes) ...")
-    with open(ROOT / "maya-mtp-calibration.log", "w", encoding="utf-8") as log, thermal_watch(cfg):
+    with open(config_dir() / "maya-mtp-calibration.log", "w", encoding="utf-8") as log, thermal_watch(cfg):
         off = qwen_decode_rate(dict(cfg, args=args), ids, ["--mtp-max-t", "1"], log)
         on = qwen_decode_rate(dict(cfg, args=args), ids, [], log)
     if off is None or on is None:
@@ -7147,6 +7203,12 @@ def main() -> int:
                                             "than your CUDA accepts)")
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
+    ap.add_argument("--build-only", action="store_true",
+                    help="HIP: only the Python packages, llama.cpp's source and every engine (GLM-5.3-Flash and "
+                         "Qwen's, DeepSeek's, MiniMax's), then exit - no model, no config")
+    ap.add_argument("--hip-archs", metavar="LIST",
+                    help="with --build-only: compile for these AMD architectures (e.g. gfx1030) instead of the GPUs "
+                         "found here - none needed (a container image's build)")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
     ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
@@ -7190,6 +7252,10 @@ def main() -> int:
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
     say(f"Project Maya v{version} - GLM-5.3-Flash, {DS4} or {MM3} on your own GPU(s).")
+    if a.hip_archs and not a.build_only:
+        ap.error("--hip-archs goes with --build-only (a setup compiles for the GPUs it uses)")
+    if a.build_only:
+        return build_only(a)
     if a.report:
         return report(version, a.backend, a.config)
     if a.import_model:
@@ -7271,7 +7337,8 @@ def main() -> int:
     rc = None                                          # the server's exit code, when it ran on the setup's screen
     if setup_screen(a):
         import setup_tui
-        cfg_path, rc = setup_tui.run(lambda: set_up_and_serve(a, prev), version, ROOT / "maya-setup.log",
+        config_dir().mkdir(parents=True, exist_ok=True)   # (MAYA_CONFIG_DIR: the setup's log goes there first)
+        cfg_path, rc = setup_tui.run(lambda: set_up_and_serve(a, prev), version, config_dir() / "maya-setup.log",
                                      ME) or (None, None)
     else:
         cfg_path = set_up(a, prev)
