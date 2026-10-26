@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -787,6 +788,67 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "1024")
         self.assertEqual(env["STRATA_GLM_SPLIT"], "0")
         self.assertNotIn("STRATA_GLM_POOL_GB", env)
+
+
+class ThermalExitTests(unittest.TestCase):
+    """MAYA_THERMAL_ABORT_C in maya.py: the server's thermal exit status (90) reaches the shell instead of the setup
+    screen's failure (1), and maya.py's own engine runs (--bench, the tunings) stop at the limit too."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.a = SimpleNamespace(backend="hip", gpu=None, gpus="0,1,2,3", port=8080, host=None, api_key=None)
+
+    def test_the_thermal_abort_status_reaches_the_shell(self):
+        with patch.object(maya, "say") as said:
+            self.assertEqual(maya.after_server(maya.TH.THERMAL_EXIT, self.a), 90)
+        self.assertIn("MAYA_THERMAL_ABORT_C", said.call_args.args[0])
+        log = self.root / "maya.log"
+        log.write_text("an earlier start's lines\n")
+
+        def served(cmd, env, info):                                  # the server's run: its abort in the log
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("[maya] THERMAL ABORT: junction 90°C on 0000:6f:00.0 (MAYA_THERMAL_ABORT_C=90): ending the "
+                        "engine\n")
+            return 90
+        ui = MagicMock()
+        ui.serve.side_effect = served
+        with patch.object(maya, "server_command", return_value=(["server"], {}, {"log": str(log)})), \
+                patch.object(maya.S, "UI", ui), patch.object(maya, "say") as said:
+            self.assertEqual(maya.serve_on_screen(Path("cfg.json"), self.a), 90)   # returned: not fail()'s 1
+        ui.fail.assert_not_called()
+        self.assertIn("junction 90°C on 0000:6f:00.0 (MAYA_THERMAL_ABORT_C=90)", said.call_args.args[0])
+
+    def test_engine_runs_of_maya_py_stop_at_the_limit(self):
+        hw = self.root / "hwmon"
+        h = hw / "hwmon0"
+        h.mkdir(parents=True)
+        (h / "name").write_text("amdgpu\n")
+        (self.root / "0000:6f:00.0").mkdir()
+        (h / "device").symlink_to(self.root / "0000:6f:00.0")
+        (h / "temp1_label").write_text("junction\n")
+        (h / "temp1_input").write_text("91000\n")
+        with patch.object(maya.TH, "HWMON", str(hw)), \
+                patch.dict(os.environ, {"STRATA_THERMAL_ABORT_C": "90", "STRATA_THERMAL_EVERY_S": "0.5"}):
+            with self.assertRaises(SystemExit) as e, maya.thermal_watch({}):
+                self.fail("a card at the limit: the engine must not start")
+            self.assertEqual(e.exception.code, 1)
+            (h / "temp1_input").write_text("50000\n")
+            ended = []
+            with patch.object(maya.TH, "end_children", side_effect=lambda: ended.append(True)):
+                with self.assertRaises(SystemExit) as e, maya.thermal_watch({"env": {}}):
+                    (h / "temp1_input").write_text("90000\n")
+                    for _ in range(100):                           # (the engine run: until its engine is ended)
+                        if ended:
+                            break
+                        time.sleep(0.05)
+            self.assertEqual(e.exception.code, 90)
+            self.assertEqual(ended, [True])
+        with patch.dict(os.environ, {}, clear=False):              # off: nothing is read, nothing refused
+            os.environ.pop("STRATA_THERMAL_ABORT_C", None)
+            with maya.thermal_watch({}):
+                pass
 
 
 if __name__ == "__main__":

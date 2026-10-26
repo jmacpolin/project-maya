@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map  # noqa: E402
+from serve import ds4_vision, gpu_map, thermal  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, literal_tags,
                             mark_literals, media_of, openai_to_messages, unmark_literals)
@@ -4061,6 +4061,23 @@ def apply_server_env(cfg: dict) -> None:
     Server.request_queue_size = _backlog()
 
 
+def thermal_guard(cfg: dict):
+    """MAYA_THERMAL_ABORT_C (serve/thermal.py): the GPU temperature guard for this start, None when it is off - from
+    the environment and the config's "env" both (the lower limit counts, so a supervisor's cannot be raised by the
+    config).  A start it refuses (a card at the limit already, no sensor to read) ends here, before the engine loads."""
+    try:
+        guard = thermal.from_env(os.environ, cfg.get("env") or {})
+    except ValueError as e:
+        raise SystemExit(f"[maya] {e}")
+    if guard is None:
+        return None
+    why = guard.refusal()
+    if why:
+        raise SystemExit(f"[maya] not serving: {why}")
+    print(f"[maya] thermal: serving {guard.describe()}", flush=True)
+    return guard
+
+
 def warn_tight_ram(arena_mib) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
@@ -4377,6 +4394,11 @@ def main() -> int:
         _srv_log = str(cfg.get("log") or "")
     if _srv_log.strip().lower() not in ("", "0", "off", "no", "false", "none"):
         tee_server_log(_srv_log)
+    # the GPU temperature guard (MAYA_THERMAL_ABORT_C; off when unset): watching from here on, the model's loading
+    # included - at the limit it ends the engine and exits with status 90 (thermal.abort)
+    guard = thermal_guard(cfg)
+    if guard is not None:
+        guard.start(thermal.abort)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
