@@ -29,7 +29,8 @@ RDNA 2 (`gfx1030`: RX 6800 / 6800 XT / 6900 XT / 6950 XT, Radeon PRO V620 / W680
 it has been run on a Radeon PRO V620 with ROCm 7 - please report how it goes on other RDNA 2 cards in an issue. These
 cards have no matrix cores (WMMA), so the engine uses its portable kernels there (the prompt attention on the F32
 kernel), and a build for RDNA 2 cards alone needs no rocWMMA headers (ROCm 7 no longer ships them). The ROCm
-installation needs its library kernels (hipBLAS) for `gfx1030`.
+installation needs its library kernels (hipBLAS) for `gfx1030`. Four V620s on a two-socket host, in a container:
+[RDNA 2: four Radeon PRO V620s](#rdna-2-four-radeon-pro-v620s).
 
 Configs are named `maya-<quant>-hip.json` and
 select the AMD device through `HIP_VISIBLE_DEVICES`.
@@ -163,6 +164,46 @@ part's pinned RAM tier at the APU's memory speed instead of the part's CPU lane.
 `MAYA_GLM_SPLIT=auto` (the split's devices are then 0 and 1; `MAYA_GLM_DEVS=0,1` says so explicitly). The helper's
 device may not be one of the split's. The engine logs one `glm helper:` line per part. Measured on this layout: see the
 speed table; the CPU lane still takes the misses the helper does not own.
+
+## RDNA 2: four Radeon PRO V620s
+
+Four V620s (32 GB each, passively cooled) split the layers like any four cards: `--gpus 0,1,2,3`. The setup writes
+the discrete-card defaults (3 GiB of VRAM headroom a card, a 1024-token prompt sub-batch and a 4096 MiB prompt
+budget); no hipBLASLt table exists for `gfx1030`, so the prompt's projections stay on plain hipBLAS. The split passes
+one small host-memory hop per token, so the cards need no peer-to-peer path between them. Not measured on the cards yet.
+
+**What is checked without the cards.** Maya at v1.1.28 compiles for `gfx1030` alone with ROCm 7.14.0 (TheRock's
+`rocm[libraries,devel,device-gfx1030]` wheels, clang 23): both engines and all 170 HIP targets of the build, the GPU
+checks of [Validation](#validation) among them; and with ROCm 7.2.0 (AMD's packages, clang 22): both engines and the
+GPU checks of [Validation](#validation). Also a static check that every kernel that needs WMMA or `sudot4`
+keeps a host-side guard RDNA 2 does not pass (the prompt attention's F32 path, the fused prompt experts on gfx1100 /
+gfx1151 only, DeepSeek's `tc_ok()`). On the cards, run the checks of [Validation](#validation) on each one first
+(`HIP_VISIBLE_DEVICES=0`, then 1, 2, 3).
+
+**Two sockets.** With the cards on one socket's PCIe lanes, keep Maya's threads on that socket's CPUs
+(`numactl --cpunodebind=<the cards' node>`; `cat /sys/bus/pci/devices/<card>/numa_node` says which). The engine
+reads the CPUs it is given: a split of four cards runs one CPU lane for all of them, sized from the physical cores
+of that node (by its sizing rule, on two 8-core Xeon Gold 6144s: 5 threads confined to one node, 12 unconfined; not
+measured), and its RAM tier is still spread page by page over both sockets' memory (`MAYA_GLM_NUMA=0` keeps it from
+doing that). Prefer `--preferred=<node>` to `--membind=<node>` for the memory: a strict bind caps the page cache
+(DeepSeek reads its experts in place) at one node and can end the engine when that node fills.
+
+**Passive cooling.** Server cards in a workstation reach their junction limit long before anything slows them down:
+`--env MAYA_THERMAL_ABORT_C=90` stops serving at 90 °C on any card's edge, junction or memory sensor, with exit
+status 90 ([Settings](SETTINGS.md)).
+
+**In a container.** The image builds both engines without the cards and keeps the configs outside itself:
+
+```sh
+./maya.sh --backend hip --build-only --hip-archs gfx1030 --yes      # in the image's build: no GPU needed
+MAYA_CONFIG_DIR=/maya-state XDG_CONFIG_HOME=/maya-state/config MAYA_UPDATE_CHECK=0 \
+  ./maya.sh --backend hip --gpus 0,1,2,3 --models-dir /models --setup --yes --download-model --no-start
+```
+
+The run needs `/dev/kfd` and `/dev/dri`, the user's `render` and `video` groups, an unlimited `memlock` (the RAM tier
+is pinned) and `/sys` (KFD's topology, the sensors). A recipe for this host - the image pinned by commit, a serve
+script with a thermal guard of its own, NUMA placement and one engine on the cards at a time - is in
+[jmacpolin/v620-Experimentation](https://github.com/jmacpolin/v620-Experimentation) (`06-MAYA.md`).
 
 ## Strix Halo
 

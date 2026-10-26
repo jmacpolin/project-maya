@@ -106,6 +106,18 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--no-speed-calibration` | the same as `--drafting on` |
 | `--yes` | the recommended answers (the model download still needs `--download-model`) |
 | `--plain` | the setup in plain text with typed answers, and Maya in the terminal, not on their own screen (a pipe gets this too, and `--yes` a plain setup); the setup screen's whole output is in `maya-setup.log` |
+| `--build-only` | AMD (`--backend hip`): only the Python packages, llama.cpp's source and both engines (GLM-5.3-Flash's `build-hip/maya` and DeepSeek's `build-hip/maya-ds4`), then exit - no model, no config |
+| `--hip-archs gfx1030` | with `--build-only`: compile for these architectures (comma-separated) instead of the GPUs found here, on a machine without them - a container image's build. A setup on the cards later finds both engines compiled for them and keeps them |
+
+## The configs in a folder of their own
+
+The configs (`maya-<model>.json`) and what goes with each - its engine log, its `run-maya-<model>.sh`, the dashboard's
+settings beside it - go into the Maya folder, and so do `maya-setup.log`, `maya-bench.txt` and `maya-report.txt`.
+`MAYA_CONFIG_DIR=/path` puts all of them in that folder instead, for a Maya folder that is read-only or replaced as a
+whole: a container image whose Maya was built with `--build-only`, with the configs, the models (`--models-dir`) and
+the tunings (`XDG_CONFIG_HOME`, `~/.config/project-maya/`) on volumes of their own. Set it for every run - the setup,
+the starts, `--bench`, `--report`: without it Maya looks in its own folder. The dashboard's About > Update needs a git
+checkout it can change; in an image set `MAYA_UPDATE_CHECK=0`.
 
 ## Web pages on another address
 

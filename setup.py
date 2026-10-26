@@ -583,13 +583,16 @@ def windows_amd_adapters() -> list:
     return parse_display_adapters(out(["powershell", "-NoProfile", "-Command", ps]))
 
 
+SYSFS = Path("/sys")                                   # (amd_gpus reads the KFD topology and render nodes here)
+
+
 def amd_gpus(hipinfo=None):
     """AMD GPUs from the kernel's KFD topology (the amdgpu driver; no ROCm needed), numbered as HIP numbers them:
     the GPU nodes in order, the CPU nodes skipped.  Integrated GPUs are listed too (not supported).  On Windows:
     ROCm's hipInfo (`hipinfo`, its path), else Windows' AMD display adapters (windows_amd_adapters)."""
     if WIN:
         return (parse_hipinfo(out([str(hipinfo)])) if hipinfo else []) or windows_amd_adapters()
-    base = Path("/sys/class/kfd/kfd/topology/nodes")
+    base = SYSFS / "class/kfd/kfd/topology/nodes"
     found = []
     if not base.is_dir():
         return found
@@ -605,7 +608,7 @@ def amd_gpus(hipinfo=None):
         except (OSError, ValueError):
             continue
         arch = f"gfx{ver // 10000}{(ver // 100) % 100:x}{ver % 100:x}"
-        dev = Path(f"/sys/class/drm/renderD{props.get('drm_render_minor', '')}/device")
+        dev = SYSFS / f"class/drm/renderD{props.get('drm_render_minor', '')}/device"
         try:
             vram = int((dev / "mem_info_vram_total").read_text()) / 2 ** 30
         except (OSError, ValueError):

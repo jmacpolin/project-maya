@@ -56,6 +56,7 @@ Nothing is installed system-wide: a missing tool is reported with the command th
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -77,6 +78,7 @@ import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./
 import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
+from serve import thermal as TH  # noqa: E402  MAYA_THERMAL_ABORT_C: the engine runs stop at a GPU temperature
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
@@ -490,10 +492,19 @@ def read_json(path: Path) -> dict:
         return {}
 
 
+def config_dir() -> Path:
+    """Where Maya keeps its configs (maya-*.json) and what goes with them - each one's log and start script, the
+    dashboard's settings beside it, the setup's log, --bench's and --report's files: this folder, or MAYA_CONFIG_DIR -
+    for a Maya folder that is read-only or replaced as a whole (a container image), with the configs on a volume of
+    their own."""
+    d = os.environ.get("MAYA_CONFIG_DIR")
+    return Path(d).expanduser().resolve() if d else ROOT
+
+
 def configs() -> list:
     """The installed models' configs, the most recently used first - not the dashboard's settings the server keeps
     beside each (<config>.shared-settings.json), which a restart took for a config of the CUDA backend."""
-    return sorted((p for p in ROOT.glob("maya-*.json") if not p.name.endswith(".shared-settings.json")),
+    return sorted((p for p in config_dir().glob("maya-*.json") if not p.name.endswith(".shared-settings.json")),
                   key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -758,6 +769,61 @@ def install_rocm(a, chosen) -> None:
              "messages")
 
 
+def linux_rocm() -> Path:
+    """The ROCm 7 the HIP engine is compiled with on Linux - ROCM_PATH, else /opt/rocm, else the newest /opt/rocm-X.Y.Z,
+    else a distribution's own packages under /usr - checked for its compiler, hipBLAS and a C++ compiler."""
+    root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
+    if not os.environ.get("ROCM_PATH") and not root.exists():
+        # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
+        versions = sorted(Path("/opt").glob("rocm-[0-9]*"),
+                          key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
+        if versions:
+            root = versions[-1]
+        elif (Path("/usr/bin/hipcc").exists() and hip_clang(Path("/usr")) is not None):
+            root = Path("/usr")   # a distribution's own ROCm packages (Fedora's: /usr/lib64/rocm/llvm, lib64)
+    root = root.resolve()
+    clang = hip_clang(root)
+    if (clang is None or clang.parent == root / "bin"
+            or not any(list((root / d).glob("libhipblas.so*")) for d in ("lib", "lib64"))):
+        fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
+    if tool_version(str(root / "bin/hipcc")) < (7, 0):
+        fail("Maya's HIP port requires ROCm 7 or newer")
+    if not shutil.which("c++"):
+        fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+    return root
+
+
+def hip_build_pc(a) -> dict:
+    """--hip-archs: what check_hip_pc gives a build, for these architectures instead of the GPUs found here - none
+    needed (a container image's build; its maya.py --setup later finds the engines compiled for the cards it sees)."""
+    if WIN or not sys.platform.startswith("linux"):
+        fail("--hip-archs builds on Linux (on Windows the setup compiles for the GPUs it finds)")
+    archs = sorted({x.strip() for x in str(a.hip_archs).split(",") if x.strip()})
+    known = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    bad = [x for x in archs if x not in known]
+    if not archs or bad:
+        fail(f"--hip-archs {a.hip_archs}: Maya's HIP build takes {', '.join(known)}")
+    root = linux_rocm()
+    ok(f"compiling for {', '.join(archs)} (--hip-archs, no GPU needed); ROCm: {root}")
+    select_build_backend("hip")
+    return {"backend": "hip", "gpus": [], "archs": archs, "rocm": str(root)}
+
+
+def build_only(a) -> int:
+    """--build-only: steps 3 and 4 alone - the Python packages, llama.cpp's source and both engines (GLM-5.3-Flash's
+    maya and DeepSeek's maya-ds4) - then exit: no model and no config.  HIP: for the GPUs found here, or with
+    --hip-archs for those architectures on a machine without them."""
+    if a.backend != "hip":
+        fail("--build-only compiles the HIP engine: --backend hip (with --hip-archs gfx1030 on a machine without the "
+             f"cards); for NVIDIA run {ME} --setup")
+    pc = hip_build_pc(a) if a.hip_archs else check_hip_pc(a)
+    llama = tools_step(a)
+    for target in ("maya", "maya-ds4"):
+        build_step(a, pc, llama, target=target)
+    ok(f"built: {', '.join(str(exe_for_target(t)) for t in ('maya', 'maya-ds4'))} ({', '.join(pc['archs'])})")
+    return 0
+
+
 def check_hip_pc(a, installed=False) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's experimental HIP backend runs on native Linux or Windows")
@@ -823,24 +889,7 @@ def check_hip_pc(a, installed=False) -> dict:
         if hipcc is not None and tool_version(str(hipcc)) < (7, 0):
             fail("Maya's HIP port requires ROCm 7 or newer")
     else:
-        root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
-        if not os.environ.get("ROCM_PATH") and not root.exists():
-            # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
-            versions = sorted(Path("/opt").glob("rocm-[0-9]*"),
-                              key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
-            if versions:
-                root = versions[-1]
-            elif (Path("/usr/bin/hipcc").exists() and hip_clang(Path("/usr")) is not None):
-                root = Path("/usr")   # a distribution's own ROCm packages (Fedora's: /usr/lib64/rocm/llvm, lib64)
-        root = root.resolve()
-        clang = hip_clang(root)
-        if (clang is None or clang.parent == root / "bin"
-                or not any(list((root / d).glob("libhipblas.so*")) for d in ("lib", "lib64"))):
-            fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
-        if tool_version(str(root / "bin/hipcc")) < (7, 0):
-            fail("Maya's HIP port requires ROCm 7 or newer")
-        if not shutil.which("c++"):
-            fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+        root = linux_rocm()
     cpu, avx2, avx512 = S.cpu_info()
     if not avx2:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
@@ -2224,11 +2273,11 @@ def write_run_script(cfg_path: Path, port: int) -> Path:
     dashboard), else (--plain, or no terminal: a service) the server's text as it prints."""
     cmd = [sys.executable, str(HERE / "maya.py"), "--config", str(cfg_path), "--port", str(port)]
     if WIN:
-        script = ROOT / f"run-{cfg_path.stem}.bat"
+        script = cfg_path.parent / f"run-{cfg_path.stem}.bat"
         script.write_text(f'@echo off\r\nrem starts the Project Maya dashboard and API (written by maya.py; {ME} does '
                           f'the same)\r\ncd /d "{ROOT}" || exit /b 1\r\n{cmdline(cmd)} %*\r\n', encoding="utf-8")
         return script
-    script = ROOT / f"run-{cfg_path.stem}.sh"
+    script = cfg_path.parent / f"run-{cfg_path.stem}.sh"
     script.write_text("#!/bin/sh\n# starts the Project Maya dashboard and API (written by maya.py; ./maya.sh does the "
                       "same)\ncd " + shlex.quote(str(ROOT)) + " || exit 1\nexec " + shlex.join(cmd) + ' "$@"\n',
                       encoding="utf-8")
@@ -2292,7 +2341,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if vision:
         cfg["vision"] = vision
     suffix = "-hip" if pc.get("backend") == "hip" else ""
-    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
+    cfg_path = config_dir() / f"maya-{quant.lower()}{suffix}.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if PROFILE.exists():
@@ -2506,6 +2556,39 @@ def busy_gpus(cfg: dict) -> list:
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
 
+@contextlib.contextmanager
+def thermal_watch(cfg: dict):
+    """MAYA_THERMAL_ABORT_C (serve/thermal.py) for an engine run of maya.py's own - --bench and the tunings, which the
+    server's guard does not see: refused while a card reads the limit or no sensor answers.  At the limit the guard's
+    thread ends the engine, and the run - whatever its own code makes of that - ends here with the server's thermal
+    exit status (90).  (Not thermal.abort's os._exit: the setup's screen would leave the terminal unusable.)"""
+    try:
+        guard = TH.from_env(os.environ, cfg.get("env") or {})
+    except ValueError as e:
+        fail(str(e))
+    if guard is None:
+        yield
+        return
+    why = guard.refusal()
+    if why:
+        fail(f"the engine does not start: {why}")
+    ok(f"thermal: the engine run {guard.describe()}")
+    tripped = []
+
+    def trip(w):
+        tripped.append(w)                              # (first: the run's code sees the engine end after this)
+        say(f"  THERMAL ABORT: {w}: ending the engine")
+        TH.end_children()
+    guard.start(trip)
+    try:
+        yield
+    finally:
+        guard.stop()
+        if tripped:
+            say(f"\n  [X]  Maya stopped: a GPU reached its temperature limit (MAYA_THERMAL_ABORT_C) - {tripped[0]}")
+            sys.exit(TH.THERMAL_EXIT)
+
+
 def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
@@ -2527,7 +2610,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CAL.run(cfg, say=say)
+        with thermal_watch(cfg):
+            res = CAL.run(cfg, say=say)
     except Exception as e:                             # never stops a setup: the engine's own choices stay
         warn(f"the tuning did not finish ({e}): the engine's own settings stay")
         why = CAL.engine_error(log, since)
@@ -2581,7 +2665,8 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CAL4.run(cfg, vram, say=say)
+        with thermal_watch(cfg):
+            res = CAL4.run(cfg, vram, say=say)
     except Exception as e:                             # the config stays as it was
         warn(f"the tuning did not finish ({e}): the config's settings stay")
         why = CAL.engine_error(log, since)
@@ -2677,7 +2762,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CD.run(without, with_d, say=say, other_label=other)
+        with thermal_watch(cfg):
+            res = CD.run(without, with_d, say=say, other_label=other)
     except Exception as e:                             # never stops a setup or a start: the config stays as it was
         now = "DFlash2" if "--dflash" in (cfg.get("args") or [])[:-1] else other
         warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps {now}; "
@@ -2734,7 +2820,8 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CDS.run(cfg, say=say)
+        with thermal_watch(cfg):
+            res = CDS.run(cfg, say=say)
     except Exception as e:                             # never stops a setup or a start: the config stays as it was
         warn(f"the speed calibration did not finish ({e}): nothing changed; {ME} --speed-calibration tries again")
         why_not = CAL.engine_error(log, since)
@@ -2972,6 +3059,11 @@ def serve_on_screen(cfg_path: Path, a) -> int:
     log = Path(info["log"]) if info.get("log") else None
     seen = log.stat().st_size if log is not None and log.is_file() else 0
     rc = S.UI.serve(cmd, env, info)
+    if rc == TH.THERMAL_EXIT:   # (returned, not fail()'s status 1: after_server says it and exits with it)
+        why = thermal_line(log, seen)
+        if why:
+            say(f"  THERMAL ABORT: {why}")
+        return rc
     if rc not in (0, UPDATE_EXIT, RESTART_EXIT):
         last = last_line(log, seen)
         fail(f"Maya stopped: its server ended with exit code {rc}",
@@ -2991,10 +3083,26 @@ def last_line(path: Path | None, since: int) -> str:
     return lines[-1][:200] if lines else ""
 
 
+def thermal_line(path: Path | None, since: int) -> str:
+    """What the server's thermal abort said (its "THERMAL ABORT: <why>: ending the engine" line in `path` after byte
+    `since`), or ""."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(since)
+            text = f.read().decode(errors="replace")
+    except (OSError, TypeError):
+        return ""
+    hits = re.findall(r"THERMAL ABORT: (.+?): ending the engine", text)
+    return hits[-1][:200] if hits else ""
+
+
 def after_server(rc: int, a) -> int:
     """The server ended: its exit code - or About > Updates moved this folder to a new release, and the new version
     starts: its maya.py compiles what changed in the engine and loads the same model (the most recently used, so no
     question)."""
+    if rc == TH.THERMAL_EXIT:
+        say(f"\n  Maya stopped: a GPU reached its temperature limit (MAYA_THERMAL_ABORT_C; exit status {rc}) - let the "
+            "cards cool, and give them more airflow, before starting it again")
     if rc not in (UPDATE_EXIT, RESTART_EXIT):
         return rc
     again = [sys.executable, str(HERE / "maya.py"), "--yes"]
@@ -3102,8 +3210,9 @@ def rocm_report(rocm: Path) -> str:
 
 
 def report(version: str, backend: str | None = None, cfg_path: Path | None = None) -> int:
-    """--report: maya-report.txt in the Maya folder - this PC, the installed setup and the engine log's speed lines,
-    for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are left out."""
+    """--report: maya-report.txt beside the configs (config_dir()) - this PC, the installed setup and the engine log's
+    speed lines, for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are
+    left out."""
     home = str(Path.home())
     lines = []
     have = [cfg_path] if cfg_path is not None else configs()
@@ -3179,10 +3288,10 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             add(f"Engine log {log.name}: the last 25 lines", "\n".join(text[-25:]))
         else:
             add(f"Engine log {log.name}", "not written yet (start Maya once and ask it something)")
-    bench_txt = ROOT / "maya-bench.txt"
+    bench_txt = config_dir() / "maya-bench.txt"
     if bench_txt.exists():
         add("Benchmark (maya-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
-    out = ROOT / "maya-report.txt"
+    out = config_dir() / "maya-report.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
     ok(f"written: {out}")
@@ -3238,10 +3347,10 @@ def bench(cfg_path: Path, version: str) -> int:
                        sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
     doc = tok.encode(text)
     lens = [n for n in (2048, 8192) if n + 64 <= ctx and n <= len(doc)]
-    log_path = ROOT / "maya-bench.log"
+    log_path = config_dir() / "maya-bench.log"
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
-    with open(log_path, "w", encoding="utf-8") as log:
+    with open(log_path, "w", encoding="utf-8") as log, thermal_watch(cfg):
         p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
                              cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
@@ -3304,7 +3413,7 @@ def bench(cfg_path: Path, version: str) -> int:
     lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]
     lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
     lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
-    out = ROOT / "maya-bench.txt"
+    out = config_dir() / "maya-bench.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
     for x in lines[:4 + len(results)]:
@@ -3831,7 +3940,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
+    cfg_path = config_dir() / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     old = read_json(cfg_path)
     # --tp is the tensor-parallel group: two equal GPUs per group (a GPU without an equal neighbour runs
     # its layers alone).  On one GPU that group must be the GPU itself: with --tp 2 the prompt path falls
@@ -4046,6 +4156,12 @@ def main() -> int:
                                             "than your CUDA accepts)")
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
+    ap.add_argument("--build-only", action="store_true",
+                    help="HIP: only the Python packages, llama.cpp's source and both engines (GLM-5.3-Flash's and "
+                         "DeepSeek's), then exit - no model, no config")
+    ap.add_argument("--hip-archs", metavar="LIST",
+                    help="with --build-only: compile for these AMD architectures (e.g. gfx1030) instead of the GPUs "
+                         "found here - none needed (a container image's build)")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
     ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
@@ -4086,6 +4202,10 @@ def main() -> int:
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
     say(f"Project Maya v{version} - GLM-5.3-Flash or {DS4} on your own GPU(s).")
+    if a.hip_archs and not a.build_only:
+        ap.error("--hip-archs goes with --build-only (a setup compiles for the GPUs it uses)")
+    if a.build_only:
+        return build_only(a)
     if a.report:
         return report(version, a.backend, a.config)
     if a.bench:
@@ -4157,7 +4277,8 @@ def main() -> int:
     rc = None                                          # the server's exit code, when it ran on the setup's screen
     if setup_screen(a):
         import setup_tui
-        cfg_path, rc = setup_tui.run(lambda: set_up_and_serve(a, prev), version, ROOT / "maya-setup.log",
+        config_dir().mkdir(parents=True, exist_ok=True)   # (MAYA_CONFIG_DIR: the setup's log goes there first)
+        cfg_path, rc = setup_tui.run(lambda: set_up_and_serve(a, prev), version, config_dir() / "maya-setup.log",
                                      ME) or (None, None)
     else:
         cfg_path = set_up(a, prev)
