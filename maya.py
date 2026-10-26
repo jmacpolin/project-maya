@@ -61,6 +61,7 @@ Nothing is installed system-wide: a missing tool is reported with the command th
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -87,6 +88,7 @@ import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU thre
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
+from serve import thermal as TH  # noqa: E402  MAYA_THERMAL_ABORT_C: the engine runs stop at a GPU temperature
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
@@ -3743,6 +3745,39 @@ def busy_gpus(cfg: dict) -> list:
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
 
+@contextlib.contextmanager
+def thermal_watch(cfg: dict):
+    """MAYA_THERMAL_ABORT_C (serve/thermal.py) for an engine run of maya.py's own - --bench and the tunings, which the
+    server's guard does not see: refused while a card reads the limit or no sensor answers.  At the limit the guard's
+    thread ends the engine, and the run - whatever its own code makes of that - ends here with the server's thermal
+    exit status (90).  (Not thermal.abort's os._exit: the setup's screen would leave the terminal unusable.)"""
+    try:
+        guard = TH.from_env(os.environ, cfg.get("env") or {})
+    except ValueError as e:
+        fail(str(e))
+    if guard is None:
+        yield
+        return
+    why = guard.refusal()
+    if why:
+        fail(f"the engine does not start: {why}")
+    ok(f"thermal: the engine run {guard.describe()}")
+    tripped = []
+
+    def trip(w):
+        tripped.append(w)                              # (first: the run's code sees the engine end after this)
+        say(f"  THERMAL ABORT: {w}: ending the engine")
+        TH.end_children()
+    guard.start(trip)
+    try:
+        yield
+    finally:
+        guard.stop()
+        if tripped:
+            say(f"\n  [X]  Maya stopped: a GPU reached its temperature limit (MAYA_THERMAL_ABORT_C) - {tripped[0]}")
+            sys.exit(TH.THERMAL_EXIT)
+
+
 def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
@@ -3773,7 +3808,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CAL.run(cfg, say=say)
+        with thermal_watch(cfg):
+            res = CAL.run(cfg, say=say)
     except Exception as e:                             # never stops a setup: the engine's own choices stay
         warn(f"the tuning did not finish ({e}): the engine's own settings stay")
         why = CAL.engine_error(log, since)
@@ -3830,7 +3866,8 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CAL4.run(cfg, vram, say=say)
+        with thermal_watch(cfg):
+            res = CAL4.run(cfg, vram, say=say)
     except Exception as e:                             # the config stays as it was
         warn(f"the tuning did not finish ({e}): the config's settings stay")
         why = CAL.engine_error(log, since)
@@ -3969,7 +4006,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CD.run(without, with_d, say=say, other_label=other)
+        with thermal_watch(cfg):
+            res = CD.run(without, with_d, say=say, other_label=other)
     except Exception as e:                             # never stops a setup or a start: the config stays as it was
         now = "DFlash2" if "--dflash" in (cfg.get("args") or [])[:-1] else other
         warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps {now}; "
@@ -4028,7 +4066,8 @@ def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CPF.run(cfg, say=say)
+        with thermal_watch(cfg):
+            res = CPF.run(cfg, say=say)
     except Exception as e:                             # never stops a setup or a start: the engine's defaults stay
         warn(f"the prefill calibration did not finish ({e}): the engine reads prompts with its defaults; "
              f"{ME} --calibrate tries again")
@@ -4080,7 +4119,8 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
-        res = CDS.run(cfg, say=say)
+        with thermal_watch(cfg):
+            res = CDS.run(cfg, say=say)
     except Exception as e:                             # never stops a setup or a start: the config stays as it was
         warn(f"the speed calibration did not finish ({e}): nothing changed; {ME} --speed-calibration tries again")
         why_not = CAL.engine_error(log, since)
@@ -4364,6 +4404,11 @@ def serve_on_screen(cfg_path: Path, a) -> int:
     log = Path(info["log"]) if info.get("log") else None
     seen = log.stat().st_size if log is not None and log.is_file() else 0
     rc = S.UI.serve(cmd, env, info)
+    if rc == TH.THERMAL_EXIT:   # (returned, not fail()'s status 1: after_server says it and exits with it)
+        why = thermal_line(log, seen)
+        if why:
+            say(f"  THERMAL ABORT: {why}")
+        return rc
     if rc not in (0, UPDATE_EXIT, RESTART_EXIT):
         last = last_line(log, seen)
         fail(f"Maya stopped: its server ended with exit code {rc}",
@@ -4383,10 +4428,26 @@ def last_line(path: Path | None, since: int) -> str:
     return lines[-1][:200] if lines else ""
 
 
+def thermal_line(path: Path | None, since: int) -> str:
+    """What the server's thermal abort said (its "THERMAL ABORT: <why>: ending the engine" line in `path` after byte
+    `since`), or ""."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(since)
+            text = f.read().decode(errors="replace")
+    except (OSError, TypeError):
+        return ""
+    hits = re.findall(r"THERMAL ABORT: (.+?): ending the engine", text)
+    return hits[-1][:200] if hits else ""
+
+
 def after_server(rc: int, a) -> int:
     """The server ended: its exit code - or About > Updates moved this folder to a new release, and the new version
     starts: its maya.py compiles what changed in the engine and loads the same model (the most recently used, so no
     question)."""
+    if rc == TH.THERMAL_EXIT:
+        say(f"\n  Maya stopped: a GPU reached its temperature limit (MAYA_THERMAL_ABORT_C; exit status {rc}) - let the "
+            "cards cool, and give them more airflow, before starting it again")
     if rc not in (UPDATE_EXIT, RESTART_EXIT):
         return rc
     again = [sys.executable, str(HERE / "maya.py"), "--yes"]
@@ -4699,7 +4760,7 @@ def bench(cfg_path: Path, version: str) -> int:
     log_path = ROOT / "maya-bench.log"
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
-    with open(log_path, "w", encoding="utf-8") as log:
+    with open(log_path, "w", encoding="utf-8") as log, thermal_watch(cfg):
         p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
                              cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
@@ -6789,7 +6850,7 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
     say()
     say("  Measuring the MTP drafter on this PC: the same answer written with and without it (the model loads twice,")
     say("  a few minutes) ...")
-    with open(ROOT / "maya-mtp-calibration.log", "w", encoding="utf-8") as log:
+    with open(ROOT / "maya-mtp-calibration.log", "w", encoding="utf-8") as log, thermal_watch(cfg):
         off = qwen_decode_rate(dict(cfg, args=args), ids, ["--mtp-max-t", "1"], log)
         on = qwen_decode_rate(dict(cfg, args=args), ids, [], log)
     if off is None or on is None:
