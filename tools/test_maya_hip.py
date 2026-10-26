@@ -33,6 +33,9 @@ class HipSetupTests(unittest.TestCase):
             patch.object(maya, "BUILD", self.root / "build"),
             patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
+            patch.object(maya, "VBUILD", self.root / "build-vision"),
+            patch.object(maya, "VEXE", self.root / "build-vision/bin/maya-vision"),
+            patch.object(maya, "VSTAMP", self.root / "build-vision/MAYA-BUILD.json"),
             patch.object(maya, "WIN", False),
             patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
             patch.object(maya.S, "amd_gpus", return_value=self.gpus),
@@ -208,9 +211,46 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
 
-    def test_hip_skips_vision_without_downloading(self):
-        with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
-            self.assertIsNone(maya.vision_step(self.a, {"backend": "hip"}, {}, self.root, self.root, "test"))
+    def compiled(self, conf, build, env, bat, nvcc=None, vcvars=None):
+        """cmake_steps for a build that worked: the encoder it would have made."""
+        self.confs.append(conf)
+        maya.VEXE.parent.mkdir(parents=True, exist_ok=True)
+        maya.VEXE.write_text("")
+
+    def test_hip_reads_pictures_with_the_cpu_encoder_by_default(self):
+        pc = maya.check_pc(self.a)
+        self.assertEqual(maya.VBUILD, self.root / "build-vision-cpu")   # (a CUDA encoder in build-vision stays)
+        self.a.yes, self.a.download_model, self.a.rebuild = True, False, False
+        d, self.confs, fetched = self.root / "models" / "Maya-S24", [], []
+
+        def fetch(url, path, sha):
+            fetched.append(path.name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x")
+        with patch.object(maya, "pick_cmake", return_value="cmake"), patch.object(maya, "run"), \
+                patch.object(maya, "cmake_steps", side_effect=self.compiled), patch.object(maya, "fetch", side_effect=fetch):
+            v = maya.vision_step(self.a, pc, {"archs": pc["archs"]}, self.root / "llama", d, "Maya-S24")
+        self.assertEqual(v, {"exe": str(self.root / "build-vision-cpu/bin/maya-vision"), "gpu": False,
+                             "mmproj": str(d / "vision/mmproj-GLM-5.3-Flash-F16.gguf"),
+                             "model": str(d / "vision/GLM-5.3-Flash-vocab.gguf")})
+        self.assertEqual(sorted(fetched), ["GLM-5.3-Flash-vocab.gguf", "mmproj-GLM-5.3-Flash-F16.gguf"])
+        self.assertIn("-DSTRATA_VISION_CUDA=OFF", self.confs[0])          # ggml's CPU backend: no GPU toolkit
+        self.assertEqual([c for c in self.confs[0] if "CUDA_ARCH" in c or "CUDA_COMPILER" in c], [])
+        self.assertEqual(maya.read_json(maya.VSTAMP)["device"], "cpu")
+        # set up again (or another GPU): the encoder and its files as they are
+        with patch.object(maya, "compile_vision", side_effect=AssertionError("compiled again")), \
+                patch.object(maya, "fetch", side_effect=AssertionError("fetched again")):
+            self.assertEqual(maya.vision_step(self.a, pc, {"archs": ["gfx1201"]}, self.root / "llama", d, "Maya-S24"), v)
+
+    def test_no_vision_and_windows_hip_read_text_only(self):
+        pc = maya.check_pc(self.a)
+        with patch.object(maya, "fetch", side_effect=AssertionError("no vision downloads")), \
+                patch.object(maya, "compile_vision", side_effect=AssertionError("no encoder build")):
+            self.a.no_vision = True
+            self.assertIsNone(maya.vision_step(self.a, pc, {}, self.root, self.root, "Maya-S24"))
+            self.a.no_vision = False
+            with patch.object(maya, "WIN", True):
+                self.assertIsNone(maya.vision_step(self.a, pc, {}, self.root, self.root, "Maya-S24"))
 
     def installed_config(self, backend="hip", gpu=None):
         tp = self.root / "tokenizer"
@@ -884,6 +924,9 @@ class V620HostTests(unittest.TestCase):
             patch.object(maya, "BUILD", self.root / "build"),
             patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
+            patch.object(maya, "VBUILD", self.root / "build-vision"),
+            patch.object(maya, "VEXE", self.root / "build-vision/bin/maya-vision"),
+            patch.object(maya, "VSTAMP", self.root / "build-vision/MAYA-BUILD.json"),
             patch.object(maya, "WIN", False),
             patch.object(maya.S, "SYSFS", sysfs),
             patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
@@ -951,6 +994,34 @@ class V620HostTests(unittest.TestCase):
         self.a.hip_archs, self.a.backend = "gfx1030", "cuda"
         with self.assertRaises(SystemExit):
             maya.build_only(self.a)
+
+    def test_build_only_builds_the_cpu_image_encoder_the_setup_keeps(self):
+        self.a.hip_archs, self.a.no_vision = "gfx1030", False
+        built, confs = [], []
+
+        def compiled(conf, build, env, bat, nvcc=None, vcvars=None):
+            confs.append(conf)
+            maya.VEXE.parent.mkdir(parents=True, exist_ok=True)
+            maya.VEXE.write_text("")
+        with patch.object(maya.S, "amd_gpus", side_effect=AssertionError("--hip-archs must not look for GPUs")), \
+                patch.object(maya, "tools_step", return_value=self.root / "llama"), \
+                patch.object(maya, "build_step", side_effect=lambda a, pc, llama, target="maya": built.append(target)), \
+                patch.object(maya, "pick_cmake", return_value="cmake"), patch.object(maya, "run"), \
+                patch.object(maya, "cmake_steps", side_effect=compiled):
+            self.assertEqual(maya.build_only(self.a), 0)
+        self.assertEqual(built, ["maya", "maya-ds4"])
+        self.assertIn("-DSTRATA_VISION_CUDA=OFF", confs[0])
+        stamp = maya.read_json(maya.VSTAMP)
+        self.assertEqual((stamp["device"], stamp["archs"]), ("cpu", ["gfx1030"]))
+        # the setup on the cards, in the container: the image's encoder, not compiled again
+        host = maya.check_pc(self.a)
+        d = self.root / "models" / "Maya-L"
+        (d / "vision").mkdir(parents=True)
+        for n in ("mmproj-GLM-5.3-Flash-F16.gguf", "GLM-5.3-Flash-vocab.gguf"):
+            (d / "vision" / n).write_text("x")
+        with patch.object(maya, "compile_vision", side_effect=AssertionError("compiled again")):
+            v = maya.vision_step(self.a, host, {"archs": ["gfx1030"]}, self.root / "llama", d, "Maya-L")
+        self.assertEqual((v["exe"], v["gpu"]), (str(self.root / "build-vision-cpu/bin/maya-vision"), False))
 
     def test_an_image_build_is_the_engine_a_setup_on_the_cards_finds(self):
         # the image: both targets compiled for --hip-archs, no GPU; the container on the host: check_hip_pc's pc
