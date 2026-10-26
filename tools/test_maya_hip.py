@@ -851,5 +851,125 @@ class ThermalExitTests(unittest.TestCase):
                 pass
 
 
+class V620HostTests(unittest.TestCase):
+    """Four Radeon PRO V620s (gfx1030) on a two-socket Xeon, as the real host's KFD topology shows them
+    (jmacpolin/v620-Experimentation bench/inventory/20261011-143843: KFD nodes 0-1 are the CPUs, one per NUMA node, 2-5
+    the GPUs, 32752 MiB each), and running Maya from a container image: the engines compiled without the cards, the
+    configs on a volume of their own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.rocm = self.root / "rocm"
+        (self.rocm / "llvm/bin").mkdir(parents=True)
+        (self.rocm / "llvm/bin/clang++").touch()
+        (self.rocm / "lib").mkdir()
+        (self.rocm / "lib/libhipblas.so").touch()
+        sysfs = self.root / "sys"
+        nodes = sysfs / "class/kfd/kfd/topology/nodes"
+        for n in range(6):
+            (nodes / str(n)).mkdir(parents=True)
+            gpu = n >= 2
+            (nodes / str(n) / "properties").write_text(
+                f"cpu_cores_count {0 if gpu else 16}\nsimd_count {144 if gpu else 0}\n"
+                f"gfx_target_version {100300 if gpu else 0}\n" + (f"drm_render_minor {126 + n}\n" if gpu else ""))
+            if gpu:
+                dev = sysfs / f"class/drm/renderD{126 + n}/device"
+                dev.mkdir(parents=True)
+                (dev / "mem_info_vram_total").write_text(str(32752 << 20))
+                (dev / "product_name").write_text("\n")   # no FRU name: the architecture's fallback name
+        for ctx in (
+            patch.object(maya, "ROOT", self.root),
+            patch.object(maya, "BUILD", self.root / "build"),
+            patch.object(maya, "EXE", self.root / "build/maya"),
+            patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
+            patch.object(maya, "WIN", False),
+            patch.object(maya.S, "SYSFS", sysfs),
+            patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
+            patch.object(maya.S, "gpus", side_effect=AssertionError("HIP must not query NVIDIA")),
+            patch.object(maya.S, "is_wsl", return_value=False),
+            # (AVX-512 without the VNNI / VBMI the engine's AVX-512 kernels need: lscpu, the same inventory)
+            patch.object(maya.S, "cpu_info", return_value=("Intel(R) Xeon(R) Gold 6144 CPU @ 3.50GHz", True, False)),
+            patch.object(maya, "mem_gb", return_value=(376, 371)),
+            patch.object(maya, "tool_version", return_value=(7, 2)),
+            patch.object(maya.shutil, "which", return_value="/usr/bin/c++"),
+        ):
+            ctx.start()
+            self.addCleanup(ctx.stop)
+        self.a = SimpleNamespace(backend="hip", gpu=None, gpus="0,1,2,3", no_vision=True, env=[], port=8080,
+                                 host=None, api_key=None, gguf_dir=None, rebuild=False, llama_dir=None, yes=True,
+                                 build_only=True, hip_archs=None)
+
+    def test_kfd_cpu_nodes_are_skipped_and_the_four_cards_split_the_layers(self):
+        gpus = maya.S.amd_gpus()
+        self.assertEqual([(g["index"], g["arch"]) for g in gpus], [(i, "gfx1030") for i in range(4)])
+        self.assertEqual({g["name"] for g in gpus}, {maya.S.AMD_NAMES["gfx1030"]})
+        self.assertAlmostEqual(gpus[0]["vram_gb"], 31.98, places=2)
+        pc = maya.check_pc(self.a)
+        self.assertEqual([g["index"] for g in pc["gpus"]], [0, 1, 2, 3])   # equal cards keep the bus order
+        self.assertEqual(pc["archs"], ["gfx1030"])                           # no WMMA arch, no rocWMMA
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]}, self.root / "pack", "Maya-L", 32768,
+                              self.root / "models", None)
+        cfg = maya.read_json(p)
+        self.assertEqual(cfg["gpu"], [0, 1, 2, 3])
+        self.assertEqual(cfg["env"], {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16",
+                                      "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
+        # (the engine picks the split; no hipBLASLt table is shipped for gfx1030, so the prompt keeps plain hipBLAS)
+        self.assertEqual(sorted((Path(maya.HERE) / "tools/hip").glob("gfx1030-*")), [])
+
+    def test_the_configs_can_live_outside_the_maya_folder(self):
+        state = self.root / "state"
+        with patch.dict(os.environ, {"MAYA_CONFIG_DIR": str(state)}):
+            pc = maya.check_pc(self.a)
+            p = maya.write_config(self.a, pc, {}, self.root / "pack", "Maya-S", 8192, self.root / "models", None)
+            self.assertEqual(p, state / "maya-maya-s-hip.json")
+            self.assertEqual(maya.read_json(p)["log"], str(state / "maya-maya-s-hip.log"))
+            self.assertEqual(maya.configs(), [p])
+            run = state / "run-maya-maya-s-hip.sh"
+            self.assertTrue(run.is_file())
+            text = run.read_text()
+            self.assertIn(f"cd {self.root} ", text)                       # the Maya folder: where maya.py is
+            self.assertIn(f"--config {p}", text)
+        self.assertEqual(maya.configs(), [])                              # (without it: the Maya folder's)
+
+    def test_build_only_compiles_both_engines_for_named_archs_without_gpus(self):
+        self.a.hip_archs = "gfx1030"
+        built = []
+        with patch.object(maya.S, "amd_gpus", side_effect=AssertionError("--hip-archs must not look for GPUs")), \
+                patch.object(maya, "tools_step", return_value=self.root / "llama"), \
+                patch.object(maya, "build_step", side_effect=lambda a, pc, llama, target="maya": built.append(
+                    (target, pc["archs"], pc["gpus"], pc["rocm"]))):
+            self.assertEqual(maya.build_only(self.a), 0)
+        rocm = str(self.rocm.resolve())
+        self.assertEqual(built, [("maya", ["gfx1030"], [], rocm), ("maya-ds4", ["gfx1030"], [], rocm)])
+        self.assertEqual(maya.EXE, self.root / "build-hip/maya")
+        for bad in ("gfx90a", "", "gfx1030,gfx1036"):
+            self.a.hip_archs = bad
+            with self.assertRaises(SystemExit):
+                maya.build_only(self.a)
+        self.a.hip_archs, self.a.backend = "gfx1030", "cuda"
+        with self.assertRaises(SystemExit):
+            maya.build_only(self.a)
+
+    def test_an_image_build_is_the_engine_a_setup_on_the_cards_finds(self):
+        # the image: both targets compiled for --hip-archs, no GPU; the container on the host: check_hip_pc's pc
+        self.a.hip_archs = "gfx1030"
+        image = maya.hip_build_pc(self.a)
+        maya.BUILD.mkdir(parents=True)
+        with patch.object(maya, "pick_cmake", return_value="cmake"), \
+                patch.object(maya, "cmake_steps", return_value=None):
+            for target in ("maya", "maya-ds4"):
+                maya.compile_engine_hip(image, self.root / "llama", "source-sha", target=target)
+                maya.exe_for_target(target).touch()
+        self.assertEqual(maya.read_json(maya.STAMP)["targets"], ["maya", "maya-ds4"])
+        host = maya.check_pc(self.a)
+        with patch.object(maya.S, "source_hash", return_value="source-sha"), \
+                patch.object(maya, "compile_engine_hip", side_effect=AssertionError("compiled again")):
+            for target in ("maya", "maya-ds4"):
+                self.assertEqual(maya.build_step(self.a, host, self.root / "llama", target=target)["archs"],
+                                 ["gfx1030"])
+
+
 if __name__ == "__main__":
     unittest.main()
