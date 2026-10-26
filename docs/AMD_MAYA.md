@@ -2,8 +2,8 @@
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
 engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
-layers (see [Two GPUs](#two-gpus)), and serves text. Images are not enabled by this installer;
-Linux users can opt into the existing [CPU image encoder](#cpu-image-encoder-on-linux).
+layers (see [Two GPUs](#two-gpus)), and serves text and, on Linux, pictures: the setup builds the
+[CPU image encoder](#cpu-image-encoder-on-linux) and fetches the vision files by default (`--no-vision`: text only).
 Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
@@ -52,58 +52,18 @@ amount.
 
 ## CPU image encoder on Linux
 
-HIP setup skips the image encoder, but the server can use the existing CPU-only
-`maya-vision` helper alongside the HIP text engine. This is an explicit manual
-setup; it does not enable an AMD GPU vision backend or change the installer's
-text-only default. Stop Maya before building or changing the config.
+The setup reads pictures by default on Linux. It builds `maya-vision`, llama.cpp's image library at the pinned commit
+with GLM-5.3-Flash's vision tower added (`tools/vision/glm5next_patch.py`, the same patch the CUDA encoder uses), on
+ggml's CPU backend, into `build-vision-cpu/` - a folder of its own, so a CUDA encoder in `build-vision/` stays as it
+is. It fetches the vision files (1.14 GB, sha256-checked) into the model's `vision/` folder, shown and asked first as
+the model is (`--yes` and `--download-model` take them). The config gets a `vision` member with `"gpu": false`, and the
+server keeps the encoder running beside the HIP engine, in system RAM. `--no-vision` sets up text only; Windows stays
+text only for now. A config set up before reads text only until it is set up again (`--setup`; the model is not
+downloaded again).
 
-After HIP setup has fetched its pinned `third_party/llama.cpp` checkout, run
-these commands from the Maya project root. If you used `--llama-dir`, use that
-same directory for both the patch and `LLAMA_DIR` below. Use a separate build
-directory to keep any existing CUDA image encoder intact.
-
-```sh
-.venv/bin/python tools/vision/glm5next_patch.py third_party/llama.cpp
-cmake -S tools/vision -B build-vision-cpu -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_DIR="$PWD/third_party/llama.cpp" -DMAYA_VISION_CUDA=OFF
-cmake --build build-vision-cpu --target maya-vision -j 2
-```
-
-The idempotent patch above adds GLM-5.3-Flash support to the pinned llama.cpp
-image library. It is the same patch used by Maya's CUDA vision installer.
-Download the matching vision files into your model-data directory (about
-1.14 GB). This example uses the artifact revision tested with Maya v1.1.5:
-
-```sh
-mkdir -p data/vision
-vision_url=https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/resolve/f16ee4ba50d8fd2bb726ea1862ca6ca14ba188da/vision
-curl -fL --retry 5 -C - -o data/vision/mmproj-GLM-5.3-Flash-F16.gguf \
-  "$vision_url/mmproj-GLM-5.3-Flash-F16.gguf"
-curl -fL --retry 5 -C - -o data/vision/GLM-5.3-Flash-vocab.gguf \
-  "$vision_url/GLM-5.3-Flash-vocab.gguf"
-printf '%s\n' \
-  '3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882  data/vision/mmproj-GLM-5.3-Flash-F16.gguf' \
-  '8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912  data/vision/GLM-5.3-Flash-vocab.gguf' \
-  | sha256sum -c -
-```
-
-Add this `vision` member to the HIP config, replacing `/absolute/path/to/maya`
-with your project path. If your model-data directory differs, use its paths:
-
-```json
-"vision": {
-  "exe": "/absolute/path/to/maya/build-vision-cpu/bin/maya-vision",
-  "mmproj": "/absolute/path/to/maya/data/vision/mmproj-GLM-5.3-Flash-F16.gguf",
-  "model": "/absolute/path/to/maya/data/vision/GLM-5.3-Flash-vocab.gguf",
-  "gpu": false
-}
-```
-
-Start with `./maya.sh --config /path/to/your-hip-config.json --port 8099`.
-Check that `/health` reports `images: true`, then send an actual image through
-`/v1/chat/completions`. Keep the manually edited config if running setup again;
-the HIP installer still writes a text-only config.
+The encoder takes 4 CPU threads, llama.cpp's default; `"threads": N` in the config's `vision` member sets another
+count. There is no AMD GPU image encoder: none has been validated. Check that `/health` reports `"images": true`, then
+send an actual picture through `/v1/chat/completions`.
 
 Verified on Linux, Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`), 128 GB unified
 RAM, ROCm 7.14.1, stock Maya v1.1.5 (`5403c222`), Maya-S24, and pinned llama.cpp
@@ -192,7 +152,8 @@ doing that). Prefer `--preferred=<node>` to `--membind=<node>` for the memory: a
 `--env MAYA_THERMAL_ABORT_C=90` stops serving at 90 °C on any card's edge, junction or memory sensor, with exit
 status 90 ([Settings](SETTINGS.md)).
 
-**In a container.** The image builds both engines without the cards and keeps the configs outside itself:
+**In a container.** The image builds both engines and the CPU image encoder without the cards, and keeps the configs
+outside itself; the setup then fetches the vision files with the model:
 
 ```sh
 ./maya.sh --backend hip --build-only --hip-archs gfx1030 --yes      # in the image's build: no GPU needed

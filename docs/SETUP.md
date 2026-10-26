@@ -56,8 +56,8 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 6. builds the *pack* - the engine's index of the model files, about 1 GB, written into the model folder. A Maya
    model's files that were already there are checked against their sha256 first (once each); the pack records the
    files, and a start refuses it if they change afterwards (`--repack` builds it again);
-7. **pictures**: compiles the image encoder (10-20 minutes, once) and fetches its files (1.1 GB, shown and asked
-   first); `--no-vision` skips it;
+7. **pictures**: compiles the image encoder (10-20 minutes, once; AMD on Linux: its CPU build, a few minutes) and
+   fetches its files (1.1 GB, shown and asked first); `--no-vision` skips it;
 8. writes `maya-<model>.json` and `run-maya-<model>.sh`; with DFlash2 it runs the
    [speed calibration](SETTINGS.md#the-speed-calibration) (5-20 minutes: DFlash2 stays only if it is faster on your
    PC); then the settings [tuned for this PC](SETTINGS.md) earlier, or it offers the tuning (about 10-15 minutes;
@@ -106,7 +106,7 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--no-speed-calibration` | the same as `--drafting on` |
 | `--yes` | the recommended answers (the model download still needs `--download-model`) |
 | `--plain` | the setup in plain text with typed answers, and Maya in the terminal, not on their own screen (a pipe gets this too, and `--yes` a plain setup); the setup screen's whole output is in `maya-setup.log` |
-| `--build-only` | AMD (`--backend hip`): only the Python packages, llama.cpp's source and both engines (GLM-5.3-Flash's `build-hip/maya` and DeepSeek's `build-hip/maya-ds4`), then exit - no model, no config |
+| `--build-only` | AMD (`--backend hip`): only the Python packages, llama.cpp's source, both engines (GLM-5.3-Flash's `build-hip/maya` and DeepSeek's `build-hip/maya-ds4`) and the image encoder (`build-vision-cpu/bin/maya-vision`; not with `--no-vision`), then exit - no model, no config |
 | `--hip-archs gfx1030` | with `--build-only`: compile for these architectures (comma-separated) instead of the GPUs found here, on a machine without them - a container image's build. A setup on the cards later finds both engines compiled for them and keeps them |
 
 ## The configs in a folder of their own

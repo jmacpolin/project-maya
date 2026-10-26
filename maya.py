@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 on your own GPU(s).
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
-validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017: CUDA on Linux, RTX 30 / A100 or newer.
+validated), Linux (pictures through the CPU image encoder) and Windows (text only).  DeepSeek-V4.1-Flash-1017: CUDA on
+Linux, RTX 30 / A100 or newer.
 
     ./maya.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./maya.sh --setup         set up again (other GPUs, another context length, another model folder)
@@ -35,8 +36,9 @@ no tuning step - it balances its own split):
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
-  7. images: compiles the vision encoder (`build-vision/bin/maya-vision`) and fetches the model's vision files
-     (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
+  7. images: compiles the vision encoder (`build-vision/bin/maya-vision`; AMD on Linux: its CPU build,
+     `build-vision-cpu/bin/maya-vision`) and fetches the model's vision files (1.1 GB, shown and asked first like
+     the model; --no-vision skips it, and so does HIP on Windows)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
      earlier, or it offers the tuning (./maya.sh --calibrate does it any time) - and starts the dashboard on
      http://127.0.0.1:8080
@@ -649,12 +651,16 @@ def fix_config_names(cfg: dict) -> bool:
 
 
 def select_build_backend(backend: str) -> None:
-    """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE
+    """Separate build folders and stamps prevent reusing a binary from the other backend (the vision encoder's too:
+    the HIP port's is its CPU build, in the folder docs/AMD_MAYA.md's manual recipe used)."""
+    global BUILD, EXE, STAMP, DS4_EXE, VBUILD, VEXE, VSTAMP
     BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
     EXE = BUILD / ("maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     STAMP = BUILD / "MAYA-BUILD.json"
+    VBUILD = ROOT / ("build-vision-cpu" if backend == "hip" else "build-vision")
+    VEXE = VBUILD / "bin" / ("maya-vision.exe" if WIN else "maya-vision")
+    VSTAMP = VBUILD / "MAYA-BUILD.json"
 
 
 def hip_unified_memory(g) -> bool:
@@ -810,9 +816,10 @@ def hip_build_pc(a) -> dict:
 
 
 def build_only(a) -> int:
-    """--build-only: steps 3 and 4 alone - the Python packages, llama.cpp's source and both engines (GLM-5.3-Flash's
-    maya and DeepSeek's maya-ds4) - then exit: no model and no config.  HIP: for the GPUs found here, or with
-    --hip-archs for those architectures on a machine without them."""
+    """--build-only: steps 3 and 4 alone - the Python packages, llama.cpp's source, both engines (GLM-5.3-Flash's
+    maya and DeepSeek's maya-ds4) and GLM-5.3-Flash's vision encoder (step 7's, not with --no-vision) - then exit: no
+    model and no config.  HIP: for the GPUs found here, or with --hip-archs for those architectures on a machine
+    without them."""
     if a.backend != "hip":
         fail("--build-only compiles the HIP engine: --backend hip (with --hip-archs gfx1030 on a machine without the "
              f"cards); for NVIDIA run {ME} --setup")
@@ -820,7 +827,14 @@ def build_only(a) -> int:
     llama = tools_step(a)
     for target in ("maya", "maya-ds4"):
         build_step(a, pc, llama, target=target)
-    ok(f"built: {', '.join(str(exe_for_target(t)) for t in ('maya', 'maya-ds4'))} ({', '.join(pc['archs'])})")
+    built = [exe_for_target(t) for t in ("maya", "maya-ds4")]
+    if not a.no_vision and not WIN:                    # (step 7 later finds it compiled: no compiler needed then)
+        meta, src = read_json(STAMP), S.source_hash(("tools/vision",))
+        if not vision_built(a, pc, meta, src) and not compile_vision(pc, meta, llama, src):
+            fail("the vision encoder did not compile (the reason is above)",
+                 f"{ME} --build-only --no-vision builds the engines alone")
+        built.append(VEXE)
+    ok(f"built: {', '.join(str(p) for p in built)} ({', '.join(pc['archs'])})")
     return 0
 
 
@@ -895,7 +909,8 @@ def check_hip_pc(a, installed=False) -> dict:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
     total, avail = mem_gb()
     split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}, text only")
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}, "
+       + ("text only" if WIN else "pictures through the CPU image encoder"))
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
@@ -2182,7 +2197,9 @@ def fetch(url: str, dst: Path, want: str | None) -> None:
 
 def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's vision tower added
-    (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
+    (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine - or, for the HIP
+    port, ggml's CPU backend alone: no AMD GPU image encoder has been validated, and the CPU one has (docs/AMD_MAYA.md,
+    "CPU image encoder on Linux")."""
     cmake = pick_cmake()
     if cmake is None:
         return False
@@ -2195,29 +2212,45 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
     archs = meta.get("archs") or pc["archs"]
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
-             f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
-             "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
-             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
-             *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
-    if meta.get("host_compiler"):
-        conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
+             f"-DLLAMA_DIR={llama}"]
+    cpu = pc.get("backend") == "hip"
+    if cpu:
+        conf.append("-DSTRATA_VISION_CUDA=OFF")
+        nvcc, what = None, "on the CPU: a few minutes, once"
+    else:
+        nvcc, what = meta.get("nvcc") or pc["nvcc"], "with ggml's CUDA kernels: 10-20 minutes, once"
+        conf += ["-DSTRATA_VISION_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
+                 f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc)]
+        if meta.get("host_compiler"):
+            conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
+    say(f"  Compiling the vision encoder (llama.cpp's image library {what}) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)], None,
-                   "build-maya-vision.bat", nvcc=meta.get("nvcc") or pc["nvcc"]):
+                   "build-maya-vision.bat", nvcc=nvcc):
         return False
-    VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
+    VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "device": "cpu" if cpu else "gpu", "llama": str(llama),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
     return VEXE.exists()
 
 
+def vision_built(a, pc, meta, src: str) -> bool:
+    """The encoder in VBUILD was compiled from this source, for these GPUs (a CPU build serves any), and is not to be
+    compiled again (--rebuild)."""
+    vmeta = read_json(VSTAMP)
+    if not VEXE.exists() or getattr(a, "rebuild", False) or vmeta.get("src") != src:
+        return False
+    return vmeta.get("device") == "cpu" or set(meta.get("archs") or pc["archs"]) <= set(vmeta.get("archs", []))
+
+
 def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
-    """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts the
+    """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts a GPU
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
-    first start how much that is on this GPU (serve/server.py, vision_footprint)."""
+    first start how much that is on this GPU (serve/server.py, vision_footprint); the HIP port's CPU encoder
+    ("gpu": false) runs beside the model from its start, in RAM."""
     step(7, "images (the vision encoder)")
-    if pc.get("backend") == "hip":
-        ok("HIP port: text only; vision is not enabled")
+    hip = pc.get("backend") == "hip"
+    if hip and WIN:
+        ok("HIP port on Windows: text only; vision is not enabled there")
         return None
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
@@ -2246,15 +2279,13 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
             fetch(src_url[p], p, m["sha256"].get(p.name))
             ok(f"{p.name} downloaded")
     src = S.source_hash(("tools/vision",))
-    vmeta = read_json(VSTAMP)
-    if not (VEXE.exists() and not a.rebuild and vmeta.get("src") == src
-            and set(meta.get("archs") or pc["archs"]) <= set(vmeta.get("archs", []))):
-        if not compile_vision(pc, meta, llama, src):
-            warn("the vision encoder did not compile (the reason is above): the model reads text only - "
-                 f"{ME} --setup --rebuild tries again")
-            return None
-    ok(f"vision encoder: {VEXE}")
-    return {"exe": str(VEXE), "mmproj": str(files["mmproj"]), "model": str(files["vocab"]), "gpu": True}
+    if not vision_built(a, pc, meta, src) and not compile_vision(pc, meta, llama, src):
+        warn("the vision encoder did not compile (the reason is above): the model reads text only - "
+             f"{ME} --setup --rebuild tries again")
+        return None
+    # (the HIP port: the CPU encoder, resident beside the model - docs/AMD_MAYA.md, "CPU image encoder on Linux")
+    ok(f"vision encoder: {VEXE}" + (" (on the CPU)" if hip else ""))
+    return {"exe": str(VEXE), "mmproj": str(files["mmproj"]), "model": str(files["vocab"]), "gpu": not hip}
 
 
 # ------------------------------------------------------------------------------------------------ 8. config + start
@@ -4157,8 +4188,8 @@ def main() -> int:
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
     ap.add_argument("--build-only", action="store_true",
-                    help="HIP: only the Python packages, llama.cpp's source and both engines (GLM-5.3-Flash's and "
-                         "DeepSeek's), then exit - no model, no config")
+                    help="HIP: only the Python packages, llama.cpp's source, both engines (GLM-5.3-Flash's and "
+                         "DeepSeek's) and the vision encoder (not with --no-vision), then exit - no model, no config")
     ap.add_argument("--hip-archs", metavar="LIST",
                     help="with --build-only: compile for these AMD architectures (e.g. gfx1030) instead of the GPUs "
                          "found here - none needed (a container image's build)")
