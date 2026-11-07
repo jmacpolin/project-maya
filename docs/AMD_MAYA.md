@@ -4,7 +4,7 @@ This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
 engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
 layers (see [Two GPUs](#two-gpus)), and reads pictures too: setup builds the image encoder for the GPU
 (ggml's HIP backend), started only while a picture is encoded, as on NVIDIA; `--no-vision` leaves it out. The
-[CPU image encoder](#cpu-image-encoder-on-linux) stays an option on Linux.
+[CPU image encoder](#cpu-image-encoder-on-linux) stays an option on Linux (`--vision-cpu`).
 Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
@@ -63,8 +63,14 @@ amount.
 ## CPU image encoder on Linux
 
 HIP setup builds a GPU image encoder (above); instead, the server can use a CPU-only
-`maya-vision` helper alongside the HIP text engine. This is an explicit manual
-setup. Stop Maya before building or changing the config.
+`maya-vision` helper alongside the HIP text engine: for a card the GPU encoder does not
+run on. `--setup --vision-cpu` does all of the below - it builds the encoder into
+`build-vision-cpu/` (ggml's CPU backend, no GPU toolkit; a few minutes), fetches the
+vision files and writes the `vision` member with `"gpu": false`; the server keeps that
+encoder running beside the model (about 1.1 GB of RAM, 4 CPU threads by default -
+`"threads"` in the member sets another count). Give it at every setup: one without it
+writes the GPU encoder's member again. `--build-only --vision-cpu` builds it beside the
+GPU one, for a container image. By hand, stop Maya before building or changing the config:
 
 After HIP setup has fetched its pinned `third_party/llama.cpp` checkout, run
 these commands from the Maya project root. If you used `--llama-dir`, use that
@@ -111,8 +117,8 @@ with your project path. If your model-data directory differs, use its paths:
 
 Start with `./maya.sh --config /path/to/your-hip-config.json --port 8099`.
 Check that `/health` reports `images: true`, then send an actual image through
-`/v1/chat/completions`. Keep the manually edited config if running setup again;
-the HIP installer still writes a text-only config.
+`/v1/chat/completions`. A setup run again writes its own `vision` member: give it
+`--vision-cpu`, or edit the config again.
 
 Verified on Linux, Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`), 128 GB unified
 RAM, ROCm 7.14.1, stock Maya v1.1.5 (`5403c222`), Maya-S24, and pinned llama.cpp

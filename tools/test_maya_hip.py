@@ -389,6 +389,61 @@ class HipSetupTests(unittest.TestCase):
         self.assertIs(compile_vision.call_args[0][0], pc)
         self.assertTrue(v["gpu"])
 
+    def vision_files(self):
+        spec = maya.MODELS.get("test") or maya.MODELS[next(iter(maya.MODELS))]
+        m = spec["vision"]
+        (self.root / m["folder"]).mkdir(parents=True, exist_ok=True)
+        for k in ("mmproj", "vocab"):
+            (self.root / m["folder"] / m[k]).write_bytes(b"x")
+
+    def test_vision_cpu_runs_the_cpu_encoder_beside_the_model(self):
+        # --vision-cpu: docs/AMD_MAYA.md's CPU image encoder as a setup option - build-vision-cpu, "gpu": false
+        self.vision_files()
+        pc = {"backend": "hip", "archs": ["gfx1030"]}
+        self.a.rebuild, self.a.vision_cpu = False, True
+        with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")), \
+                patch.object(maya, "compile_vision", return_value=True) as compile_vision:
+            v = maya.vision_step(self.a, pc, {"archs": ["gfx1030"]}, self.root, self.root, "test")
+        self.assertTrue(compile_vision.call_args.kwargs["cpu"])
+        self.assertFalse(v["gpu"])
+        self.assertEqual(v["exe"], str(self.root / "build-vision-cpu/bin/maya-vision"))
+        # a CPU build already there (any GPU architecture) is kept
+        exe = self.root / "build-vision-cpu/bin/maya-vision"
+        exe.parent.mkdir(parents=True)
+        exe.touch()
+        (self.root / "build-vision-cpu/MAYA-BUILD.json").write_text(json.dumps(
+            {"src": maya.S.source_hash(("tools/vision",)), "archs": [], "backend": "cpu"}))
+        with patch.object(maya, "compile_vision", side_effect=AssertionError("compiled again")):
+            self.assertFalse(maya.vision_step(self.a, pc, {"archs": ["gfx1030"]}, self.root, self.root, "test")["gpu"])
+
+    def test_the_cpu_encoder_builds_without_a_gpu_toolkit(self):
+        conf = []
+
+        def steps(c, build, *args, **kw):
+            conf.extend(c)
+            exe = self.root / "build-vision-cpu/bin/maya-vision"
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            exe.touch()
+        with patch.object(maya, "pick_cmake", return_value="cmake"), patch.object(maya, "run"), \
+                patch.object(maya, "venv_tool", return_value=None), \
+                patch.object(maya, "cmake_steps", side_effect=steps) as cs:
+            self.assertTrue(maya.compile_vision({"backend": "hip", "archs": ["gfx1030"]}, {"archs": ["gfx1030"]},
+                                                self.root / "llama", "vision-src", cpu=True))
+        self.assertIn("-DSTRATA_VISION_HIP=OFF", conf)
+        self.assertNotIn("-DSTRATA_VISION_HIP=ON", conf)
+        self.assertFalse([c for c in conf if c.startswith(("-DAMDGPU_TARGETS", "-DCMAKE_HIP", "-DCMAKE_CUDA"))])
+        self.assertEqual(conf[conf.index("-B") + 1], str(self.root / "build-vision-cpu"))
+        self.assertIsNone(cs.call_args.kwargs["nvcc"])
+        self.assertEqual(maya.read_json(self.root / "build-vision-cpu/MAYA-BUILD.json")["backend"], "cpu")
+
+    def test_vision_cpu_is_for_linux(self):
+        self.a.vision_cpu = True
+        with patch.object(maya, "WIN", True), self.assertRaises(SystemExit):
+            maya.vision_cpu(self.a)
+        self.a.vision_cpu = False
+        with patch.object(maya, "WIN", True):
+            self.assertFalse(maya.vision_cpu(self.a))
+
     def installed_config(self, backend="hip", gpu=None):
         tp = self.root / "tokenizer"
         tp.mkdir(exist_ok=True)
@@ -1201,6 +1256,31 @@ class V620HostTests(unittest.TestCase):
                 maya.build_only(self.a)
         self.a.hip_archs, self.a.backend = "gfx1030", "cuda"
         with self.assertRaises(SystemExit):
+            maya.build_only(self.a)
+
+    def test_build_only_builds_the_image_encoder_too(self):
+        self.a.hip_archs, self.a.no_vision = "gfx1030", False
+        asked = []
+
+        def ready(a, pc, meta, llama, cpu=None, said=True):
+            asked.append((cpu, said, pc["archs"]))
+            return True
+        with patch.object(maya, "tools_step", return_value=self.root / "llama"), \
+                patch.object(maya, "build_step"), patch.object(maya, "vision_encoder_ready", side_effect=ready):
+            self.assertEqual(maya.build_only(self.a), 0)
+            self.assertEqual(asked, [(False, False, ["gfx1030"])])          # the GPU encoder, for --hip-archs
+            asked.clear()
+            self.a.vision_cpu = True
+            self.assertEqual(maya.build_only(self.a), 0)
+            self.assertEqual([c for c, _, _ in asked], [False, True])     # ... and the CPU one beside it
+            asked.clear()
+            self.a.no_vision = True
+            self.assertEqual(maya.build_only(self.a), 0)
+            self.assertEqual(asked, [])                                     # --no-vision: the engines alone
+        self.a.no_vision = False
+        with patch.object(maya, "tools_step", return_value=self.root / "llama"), \
+                patch.object(maya, "build_step"), patch.object(maya, "vision_encoder_ready", return_value=False), \
+                self.assertRaises(SystemExit):
             maya.build_only(self.a)
 
     def test_an_image_build_is_the_engine_a_setup_on_the_cards_finds(self):

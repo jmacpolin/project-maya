@@ -85,7 +85,7 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
    model's files that were already there are checked against their sha256 first (once each); the pack records the
    files, and a start refuses it if they change afterwards (`--repack` builds it again);
 7. **pictures**: compiles the image encoder (10-20 minutes, once) and fetches its files (1.1 GB, shown and asked
-   first); `--no-vision` skips it;
+   first); `--no-vision` skips it, `--vision-cpu` builds it for the CPU instead (Linux);
 8. writes `maya-<model>.json` and `run-maya-<model>.sh`; with DFlash2 it runs the
    [speed calibration](SETTINGS.md#the-speed-calibration) (5-20 minutes: DFlash2 stays only if it is faster on your
    PC); then the settings [tuned for this PC](SETTINGS.md) earlier, or it offers the tuning (about 10-15 minutes;
@@ -184,6 +184,7 @@ WantedBy=multi-user.target
 | `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `maya-s`, `maya-xs` (Maya's quants, the same as `--model deepseek-maya-s` / `deepseek-maya-xs`; Maya-S the default), `gguf-q8` (unsloth's UD-Q8_K_XL GGUF), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0; not in the setup's list, named by hand), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits), `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM), `abliterated-128g` / `abliterated-256g` (orcarouter's abliterated model as its Mix-128G / Mix-256G GGUF, with Maya's Q6_K n-gram tables; `abliterated`: the one this PC holds; a gated repo: `HF_TOKEN` or `hf auth login`); the EXL3 quants need NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer) and are offered only there, and on AMD (as GLM's EXL3 quants there; [docs/EXL3_HIP.md](EXL3_HIP.md)) |
 | `--mm3-quant Q` | MiniMax-M3.1-Flash's files: `exl3` (Mia-AiLab's EXL3 quant at 3.5 bits, NVIDIA), `maya-xs` or `maya-s` (Maya's GGUF quants, the same as `--model minimax-maya-xs` / `minimax-maya-s`; `gguf-xs` / `gguf-s` before) |
 | `--no-vision` | text only: no image encoder (DeepSeek, MiniMax: their vision tower off; Qwen-3.8-Flash-Next: no mmproj download) |
+| `--vision-cpu` | Linux: GLM-5.3-Flash's and Qwen's image encoder on the CPU (`build-vision-cpu/`), running beside the model in about 1.1 GB of RAM, instead of the GPU encoder started only while a picture is read - for a card the GPU encoder does not run on. Give it at every setup; with `--build-only` it is built beside the GPU one |
 | `--draft mtp` / `--draft dflash2` | how the model drafts tokens ahead: its MTP block (the default), or a DFlash2 drafter - downloaded (0.7 GB) into `DIR/GLM-5.3-Flash-DFlash2/` and passed as `--dflash` (Maya-L: +44% on nine GPUs, +12% on two, +19% on one GPU; NVIDIA RTX 30 / A100 and newer, and one AMD Ryzen AI Max APU (Strix / Gorgon Halo) - older cards and other AMD GPUs keep the MTP block unless you pass this; the drafter's license is CC BY-NC-ND 4.0, non-commercial use only). The [speed calibration](SETTINGS.md#the-speed-calibration) then keeps it only if it is faster on your PC |
 | `--gpu N` / `--gpus 0,1,2,3` | one GPU, or several (up to 16) that split the model's layers |
 | `--context N` | context length in tokens: 8192, 32768 (default), 65536, 131072; DeepSeek: 32768, 65536, 131072, 262144, 524288, 1048576 (the default 262144 where VRAM + RAM hold the model, else 65536); MiniMax: the same, the default by this PC's memory |

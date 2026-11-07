@@ -1195,8 +1195,9 @@ BUILD_ONLY_TARGETS = ("maya", "maya-ds4", "maya-mm3")   # GLM-5.3-Flash and Qwen
 
 def build_only(a) -> int:
     """--build-only: steps 3 and 4 alone - the Python packages, llama.cpp's source and every engine (maya: GLM-5.3-Flash
-    and Qwen; maya-ds4: DeepSeek; maya-mm3: MiniMax) - then exit: no model and no config.  HIP: for the GPUs found
-    here, or with --hip-archs for those architectures on a machine without them."""
+    and Qwen; maya-ds4: DeepSeek; maya-mm3: MiniMax) - and step 7's image encoder (not with --no-vision; the CPU one
+    too with --vision-cpu), then exit: no model and no config.  HIP: for the GPUs found here, or with --hip-archs for
+    those architectures on a machine without them."""
     if a.backend != "hip":
         fail("--build-only compiles the HIP engine: --backend hip (with --hip-archs gfx1030 on a machine without the "
              f"cards); for NVIDIA run {ME} --setup")
@@ -1204,7 +1205,15 @@ def build_only(a) -> int:
     llama = tools_step(a)
     for target in BUILD_ONLY_TARGETS:
         build_step(a, pc, llama, target=target)
-    ok(f"built: {', '.join(str(exe_for_target(t)) for t in BUILD_ONLY_TARGETS)} ({', '.join(pc['archs'])})")
+    built = [exe_for_target(t) for t in BUILD_ONLY_TARGETS]
+    if not getattr(a, "no_vision", False):         # the image encoder (step 7's), stamped so a setup keeps it
+        meta = read_json(STAMP)
+        for cpu in (False, True) if vision_cpu(a) else (False,):
+            if not vision_encoder_ready(a, pc, meta, llama, cpu=cpu, said=False):
+                fail(f"the {'CPU ' if cpu else ''}image encoder did not compile (the reason is above)",
+                     f"{ME} --backend hip --build-only --rebuild tries again; --no-vision builds the engines alone")
+            built.append(vision_paths(cpu)[1])
+    ok(f"built: {', '.join(str(p) for p in built)} ({', '.join(pc['archs'])})")
     return 0
 
 
@@ -3163,26 +3172,51 @@ def fetch(url: str, dst: Path, want: str | None) -> None:
              f"run {ME} --setup again to download it again")
 
 
-def compile_vision(pc, meta, llama: Path, src: str) -> bool:
+def vision_paths(cpu: bool = False) -> tuple:
+    """The image encoder's build folder, binary and stamp: build-vision's (the GPU's: CUDA, HIP or Metal) or, with
+    --vision-cpu, build-vision-cpu's - ggml's CPU backend, no GPU toolkit (docs/AMD_MAYA.md, "CPU image encoder")."""
+    if not cpu:
+        return VBUILD, VEXE, VSTAMP
+    b = ROOT / "build-vision-cpu"
+    return b, b / "bin" / ("maya-vision.exe" if WIN else "maya-vision"), b / "MAYA-BUILD.json"
+
+
+def vision_cpu(a) -> bool:
+    """--vision-cpu: the image encoder on the CPU, running beside the model (Linux) - for a card the GPU encoder does
+    not run on."""
+    if not getattr(a, "vision_cpu", False):
+        return False
+    if WIN or getattr(a, "backend", None) == "metal" or not sys.platform.startswith("linux"):
+        fail("--vision-cpu builds the CPU image encoder on Linux (elsewhere the encoder runs on the GPU)")
+    return True
+
+
+def compile_vision(pc, meta, llama: Path, src: str, cpu: bool = False) -> bool:
     """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's vision tower added
-    (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
+    (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine - or, cpu
+    (--vision-cpu), on ggml's CPU backend alone, into build-vision-cpu."""
     cmake = pick_cmake()
     if cmake is None:
         return False
+    vbuild, vexe, vstamp = vision_paths(cpu)
     run([sys.executable, str(ROOT / "tools" / "vision" / "glm5next_patch.py"), str(llama)])
-    gen = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (VBUILD / "CMakeCache.txt").read_text(errors="replace"), re.M) \
-        if (VBUILD / "CMakeCache.txt").exists() else None
+    gen = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (vbuild / "CMakeCache.txt").read_text(errors="replace"), re.M) \
+        if (vbuild / "CMakeCache.txt").exists() else None
     ninja = venv_tool("ninja") or shutil.which("ninja")
     conf = [cmake]
     if ninja and (gen is None or gen.group(1).strip() == "Ninja"):
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
     metal = pc.get("backend") == "metal"
     archs = meta.get("archs") or pc.get("archs") or []
-    conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
+    conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(vbuild), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}"]
-    hip = pc.get("backend") == "hip"
+    hip = pc.get("backend") == "hip" and not cpu
     env = vcvars = bindir = None
-    if hip:
+    if cpu:
+        conf += ["-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_VISION_HIP=OFF"]   # (ggml's CPU backend: no GPU toolkit)
+        if S.ARM and S.arm_cpu_arch():
+            conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
+    elif hip:
         conf += ["-DSTRATA_VISION_HIP=ON",
                  "-DSTRATA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
@@ -3205,29 +3239,29 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
                  *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
-    if meta.get("host_compiler") and not metal and not hip:
+    if meta.get("host_compiler") and not metal and not hip and not cpu:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
-        ", once) ...")
-    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
-                   dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
-                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
+        ("CPU backend: a few minutes" if cpu else "Metal backend: a minute or two" if metal else
+         ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") + ", once) ...")
+    if cmake_steps(conf, [cmake, "--build", str(vbuild), "--target", "maya-vision", "-j", str(jobs)],
+                   dict(os.environ) if metal or cpu else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
+                   nvcc=None if metal or hip or cpu else meta.get("nvcc") or pc["nvcc"]):
         return False
-    if bindir is not None and VEXE.exists():
-        copy_hip_dlls(bindir, VEXE.parent)
-    VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
-                                  "backend": pc.get("backend"),
+    if bindir is not None and vexe.exists():
+        copy_hip_dlls(bindir, vexe.parent)
+    vstamp.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
+                                  "backend": "cpu" if cpu else pc.get("backend"),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
-    return VEXE.exists()
+    return vexe.exists()
 
 
 def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts the
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
     first start how much that is on this GPU (serve/server.py, vision_footprint).  On a Mac (Metal: one memory, no
-    lending) it stays resident beside the model."""
+    lending) it stays resident beside the model; so does the CPU encoder of --vision-cpu (Linux)."""
     step(7, "images (the vision encoder)")
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
@@ -3236,6 +3270,7 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
         return None
+    cpu = vision_cpu(a)
     if m is None:
         warn(f"no vision files are published for {quant}: the model reads text only")
         return None
@@ -3255,16 +3290,11 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
         for p in missing:
             fetch(src_url[p], p, m["sha256"].get(p.name))
             ok(f"{p.name} downloaded")
-    src = S.source_hash(("tools/vision",))
-    vmeta = read_json(VSTAMP)
-    if not (VEXE.exists() and not a.rebuild and vmeta.get("src") == src
-            and set(meta.get("archs") or pc.get("archs") or []) <= set(vmeta.get("archs", []))):
-        if not compile_vision(pc, meta, llama, src):
-            warn("the vision encoder did not compile (the reason is above): the model reads text only - "
-                 f"{ME} --setup --rebuild tries again")
-            return None
-    ok(f"vision encoder: {VEXE}")
-    return {"exe": str(VEXE), "mmproj": str(files["mmproj"]), "model": str(files["vocab"]), "gpu": True}
+    if not vision_encoder_ready(a, pc, meta, llama):   # (--vision-cpu: its CPU build)
+        return None
+    exe = vision_paths(cpu)[1]
+    ok(f"vision encoder: {exe}" + (" (on the CPU, running beside the model: --vision-cpu)" if cpu else ""))
+    return {"exe": str(exe), "mmproj": str(files["mmproj"]), "model": str(files["vocab"]), "gpu": not cpu}
 
 
 # ------------------------------------------------------------------------------------------------ 8. config + start
@@ -6935,17 +6965,21 @@ def qwen_vision_model() -> dict | None:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
-def vision_encoder_ready(a, pc: dict, meta: dict, llama: Path) -> bool:
-    """build-vision's maya-vision for this PC's GPUs, compiled when it is not there or its source changed."""
+def vision_encoder_ready(a, pc: dict, meta: dict, llama: Path, cpu: bool | None = None, said: bool = True) -> bool:
+    """build-vision's maya-vision for this PC's GPUs - or, cpu (--vision-cpu by default), build-vision-cpu's for the
+    CPU - compiled when it is not there or its source changed.  said=False: no warning when it does not compile."""
+    cpu = vision_cpu(a) if cpu is None else cpu
+    vexe, vstamp = vision_paths(cpu)[1:]
     src = S.source_hash(("tools/vision",))
-    vmeta = read_json(VSTAMP)
-    if VEXE.exists() and not a.rebuild and vmeta.get("src") == src \
-            and set(meta.get("archs") or pc.get("archs") or []) <= set(vmeta.get("archs", [])):
+    vmeta = read_json(vstamp)
+    if vexe.exists() and not getattr(a, "rebuild", False) and vmeta.get("src") == src \
+            and (cpu or set(meta.get("archs") or pc.get("archs") or []) <= set(vmeta.get("archs", []))):
         return True
-    if compile_vision(pc, meta, llama, src):
+    if compile_vision(pc, meta, llama, src, cpu=True) if cpu else compile_vision(pc, meta, llama, src):
         return True
-    warn("the vision encoder did not compile (the reason is above): the model reads text only - "
-         f"{ME} --setup --rebuild tries again")
+    if said:
+        warn("the vision encoder did not compile (the reason is above): the model reads text only - "
+             f"{ME} --setup --rebuild tries again")
     return False
 
 
@@ -6975,11 +7009,14 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path,
         if not sha256_checked(f, m["sha256"][f.name]):
             f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
             fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
-    if not vision_encoder_ready(a, pc, meta, llama):
+    cpu = vision_cpu(a)
+    if not vision_encoder_ready(a, pc, meta, llama):   # (--vision-cpu: its CPU build)
         return None
-    ok(f"pictures: ON - the vision encoder {VEXE} with {files[0].name} ({m['download_gb']:.1f} GB on the SSD); it "
-       "starts only when a picture arrives, no VRAM kept for it")
-    return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
+    exe = vision_paths(cpu)[1]
+    ok(f"pictures: ON - the vision encoder {exe} with {files[0].name} ({m['download_gb']:.1f} GB on the SSD); " +
+       ("on the CPU, running beside the model (--vision-cpu)" if cpu else
+        "it starts only when a picture arrives, no VRAM kept for it"))
+    return {"exe": str(exe), "mmproj": str(files[0]), "model": str(gguf), "gpu": not cpu}
 
 
 def choose_qwen_quant(a, prev: dict) -> str:
@@ -7170,6 +7207,10 @@ def main() -> int:
                          "and one AMD Ryzen AI Max APU)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
+    ap.add_argument("--vision-cpu", action="store_true",
+                    help="Linux: the image encoder on the CPU (build-vision-cpu), running beside the model in 1.1 GB "
+                         "of RAM, instead of the GPU encoder started only while a picture is read - for a card the GPU "
+                         "encoder does not run on; give it at every setup. With --build-only: built beside the GPU one")
     ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
                                        "or the .gguf file (the first one of a split model) when the folder holds "
                                        "several models; it must be writable - the pack is written inside it "
