@@ -299,6 +299,8 @@ struct MoeDev {
     unsigned int* dcnt = nullptr;              // ... [n_keys] routes per key (halved every 4096 routes): the coldest
                                                //     RAM-tier experts go to the host, the hot ones are promoted
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
+    int* route_err_d = nullptr;                // ... and its device copy, which the route kernel reads (a read of the
+                                               //     host-mapped one crossed PCIe at every route's start); null: none
     const int* skip = nullptr;                 // set_skip's flag: non-zero = the experts' kernels do nothing
     // moe_experts_multi: mt_T tokens in one launch, token t's plan at plan_ptr / plan_w + 8 t and its rows at these
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
@@ -345,6 +347,13 @@ struct MoeResponse {
     volatile unsigned int seq;
     unsigned int ptr_mask;            // plan entries the host made resident: ptr[i] valid
     unsigned long long ptr[8];
+    // STRATA_GLM_STREAM_FETCH=1: entries in stream_mask were posted before their disk reads finished; ready[i] gets
+    // bit (part * s_chunks + chunk) as each chunk lands in ptr[i] (fast_read_part's layout: gate 0, up s_gu, down
+    // 2 s_gu), and the fetch kernels copy each chunk once its bit is set (zephel01/Abyss d626d96, mw00 #570)
+    unsigned int stream_mask;
+    unsigned int ready[8];
+    unsigned long long s_gu, s_dn;
+    int s_chunks;
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
     unsigned long long upd_val[64];
@@ -360,7 +369,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0, int win = 0,
                unsigned int* scr_used = nullptr, int win_n = 0, int disk_skip_from = 8, float disk_skip_w = 0.0f,
-               float miss_skip_w = 0.0f, int win_rows = 0);
+               float miss_skip_w = 0.0f, int win_rows = 0, bool resident_ok = true);
 /// A verify window's MoE layer with each distinct expert computed ONCE: the T tokens were routed one after another into
 /// their own plan arrays (moe_route with win = t and a scr_used word, so no two of them land in one scratch slot - the
 /// word's bit 31 says one did), then moe_win_experts groups the entries by expert slot, reads each expert's gate/up and
@@ -402,6 +411,10 @@ void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
 void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s);
 /// The side stream's copy of the prefetch list (pf_src -> pf_dst, pf_n entries of blob_bytes each).
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
+/// STRATA_GLM_PF_CE: need = (this route prefetched anything) ? its seq : 0 - read after the route, on its stream
+void moe_pf_need(const MoeDev& d, unsigned int* need, cudaStream_t s);
+/// STRATA_GLM_PF_CE: hold the stream until flag reaches need (no-op for need 0; gives up after ~25 s)
+void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
@@ -456,8 +469,12 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 /// Q6_K or 8 = Q8_0), dequantized as ggml's to_float does (the same floats).  n_embd % 256 == 0.
 void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s);
 /// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
-/// map[i - map_from] (a draft head's gathered rows -> their token ids).
+/// map[i - map_from] (a draft head's gathered rows -> their token ids).  No finite value among the n (#860): *out is
+/// 0 - a valid id, map[] never read - and the current device's argmax_nonfinite() count goes up.
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
+/// How many argmax calls on the current device found no finite value since the process started (a synchronous read
+/// of a device word: call it with the device idle, never per token).  0 on a read error.
+unsigned argmax_nonfinite();
 /// argmax over x[0..n) with its value: out[0] the index (0x7fffffff when nothing is finite), out[1] the value's bits.
 void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// The pick of a row split in two at c0 from both halves' argmax_pair (b's index relative to c0): argmax's for the

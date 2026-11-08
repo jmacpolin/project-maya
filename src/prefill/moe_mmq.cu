@@ -2,6 +2,7 @@
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/failure.hpp"
 
 #include "common.cuh"
 #include "convert.cuh"
@@ -14,10 +15,12 @@
 namespace strata::prefill::mmq {
 namespace {
 
+// A failed launch (an allocation, most of the time) ends this request, not the process: the reason is thrown and
+// the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        strata::prefill::fail(std::string("prefill mmq: ") + what + ": " + cudaGetErrorString(e));
     }
 }
 
@@ -141,6 +144,7 @@ void dispatch(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s)
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
         case GGML_TYPE_IQ1_S: mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, a, s); break;
+        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;   // (the Qwen path only: prefill.cpp)
         case GGML_TYPE_Q2_K: mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, a, s); break;
         case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;

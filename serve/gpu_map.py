@@ -9,7 +9,7 @@ from __future__ import annotations
 # tower runs in the engine's own process: vision_own, and which also tells its prompt chunks' buffers apart (prompt)
 # and what its tensor parallel copies (tp, of a group of tp_n GPUs - out of its weights and kv))
 BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision",
-         "vision_own", "prompt", "tp")
+         "vision_own", "prompt", "tp", "helper")
 
 
 def parse(line: str) -> dict | None:
@@ -94,7 +94,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid, vision_pid=No
         pool = max(0, r.get("pool", 0) - (r.get("tail", 0) if lent else 0))
         parts = {"weights": r.get("weights", 0), "kv": r.get("kv", 0), "act": r.get("act", 0),
                  "prompt": r.get("prompt", 0), "tp": r.get("tp", 0),
-                 "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool}
+                 "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool, "helper": r.get("helper", 0)}
         engine = sum(parts.values())
         own, enc = held_by(procs, mine), held_by(procs, enc_pids)
         inside = r.get("vision_own", 0) if enc is None else 0   # (a vision tower in the engine's own process)
@@ -126,4 +126,22 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid, vision_pid=No
                     "slots": r.get("slots", 0), "layers": r.get("layers"), "ctx": r.get("ctx", 0),
                     "tp_n": r.get("tp_n", 0),
                     "kv_ram": r.get("kv_ram", 0), "measured": "nvml" if own is not None else "start"})
-    return out
+    return tp_rooms(out)
+
+
+def tp_rooms(gpus: list[dict]) -> list[dict]:
+    """A tensor-parallel group's members (tp_n > 1, the same layers) hold the same expert slots: a slot more takes room
+    on every member, so the room the next start's pool can use is the group's least free.  Each member gets
+    `tp_group` (its group's first dev) and `tp_room` (that least free); the room a member has beyond it stays idle -
+    the Monitor does not promise experts for it."""
+    groups: dict[tuple, list[dict]] = {}
+    for g in gpus:
+        lay = g.get("layers")
+        if g.get("tp_n", 0) > 1 and lay and lay[0] >= 0:
+            groups.setdefault((g["tp_n"], lay[0], lay[1]), []).append(g)
+    for ms in groups.values():
+        if len(ms) > 1:
+            room, first = min(m["free"] for m in ms), min(m["dev"] for m in ms)
+            for m in ms:
+                m.update(tp_group=first, tp_room=room)
+    return gpus

@@ -2,6 +2,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/prefill/failure.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -18,14 +19,32 @@ constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 __device__ __forceinline__ float warp_max(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false)));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
+#endif
 }
 __device__ __forceinline__ uint16_t bf(float f) {
     uint32_t u = __float_as_uint(f);
@@ -48,9 +67,14 @@ __device__ float block_sum(float v, float* sh) {
     __syncthreads();
     return sh[0];
 }
+// A failed launch (an allocation, most of the time) ends this request, not the process: the reason is thrown and
+// the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e));
+        strata::prefill::fail(std::string("prefill ") + what + ": " + cudaGetErrorString(e));
+    }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
@@ -521,8 +545,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
         return;
     }
-    float a = fabsf(x);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    float a = warp_max(fabsf(x));
     __shared__ float wm[2];
     if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = a;
     __syncthreads();

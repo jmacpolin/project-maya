@@ -3,13 +3,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdint>
+#include <limits>
 #include <utility>
+#include <vector>
 
 namespace strata::core::glmfast {
 
-// The complete pool and the all-resident launch skip (STRATA_GLM_COMPLETE_POOL, STRATA_GLM_RESIDENT_SKIP): on by
-// default on AMD, where the Strix / Gorgon Halo APUs hold every expert (measured there); an NVIDIA build keeps the
-// capped pool and every route's launches unless the setting is 1.  The setting, when given, wins either way.
+// The all-resident launch skip (STRATA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
+// default on AMD, where the Strix / Gorgon Halo APUs hold every expert (measured there); an NVIDIA build launches
+// every route's kernels unless the setting is 1.  The setting, when given, wins either way.
 inline bool on_by_default_on_amd(const char* env) {
     if (const char* v = std::getenv(env)) return std::atoi(v) != 0;
 #if defined(STRATA_USE_HIP)
@@ -17,6 +20,15 @@ inline bool on_by_default_on_amd(const char* env) {
 #else
     return false;
 #endif
+}
+// The complete pool (STRATA_GLM_COMPLETE_POOL): on by default on every GPU since v1.1.35 - it is taken only where
+// the budget holds every expert, the spares and the prompt path's tail (complete_pool_slots), so the capped pool
+// stays wherever it is needed.  NVIDIA kept the capped pool before, even where the budget held a complete one: a long
+// prompt's borrow then evicted ~270 residents a layer for good and the CPU lane ran the decode's misses (#474: 4x A100,
+// 33 tok/s instead of 83).  The setting, when given, wins either way (0: the capped pool, for A/B).
+inline bool complete_pool_on() {
+    if (const char* v = std::getenv("STRATA_GLM_COMPLETE_POOL")) return std::atoi(v) != 0;
+    return true;
 }
 // ... and the other way round: on by default on NVIDIA, off on AMD unless the setting is 1
 inline bool off_by_default_on_amd(const char* env) {
@@ -126,6 +138,49 @@ inline size_t pagefile_hint_gib(size_t commit_limit, size_t ram_total, size_t ke
 // more than there are experts (a complete pool has more slots than experts: the warm-up's order lists each once)
 inline int warm_pool_slots(bool unified, int slots, int experts, int spares) {
     return full_unified_pool(unified, slots, experts) ? experts : std::min(experts, std::max(0, slots - spares));
+}
+
+// Ordinary tiers and staging-only APU tiers retain their existing sizing policy.
+inline bool balanced_resident_ram(bool requested, bool resident, bool staging_only) {
+    return requested && resident && !staging_only;
+}
+
+// Reserve each class's mandatory slots before spending anything on optional slack.
+// Failure leaves slots untouched. Counts must fit RamClass::n (int), and every
+// multiplication is bounded by the remaining byte budget before it is performed.
+inline bool ram_class_plan(uint64_t budget, const std::vector<size_t>& stride,
+                           const std::vector<int64_t>& required, const std::vector<int64_t>& preferred,
+                           std::vector<int64_t>& slots) {
+    if (stride.size() != required.size() || stride.size() != preferred.size()) return false;
+    std::vector<int64_t> plan(required);
+    uint64_t left = budget;
+    long double optional_bytes = 0;
+    for (size_t c = 0; c < stride.size(); ++c) {
+        if (!stride[c] || required[c] < 0 || preferred[c] < required[c] ||
+            preferred[c] > std::numeric_limits<int>::max()) return false;
+        if ((uint64_t) required[c] > left / stride[c]) return false;
+        left -= (uint64_t) required[c] * stride[c];
+        optional_bytes += (long double) (preferred[c] - required[c]) * stride[c];
+    }
+    const uint64_t extra_budget = left;
+    if (optional_bytes > 0) {
+        for (size_t c = 0; c < stride.size(); ++c) {
+            const int64_t room = preferred[c] - required[c];
+            const long double share = (long double) extra_budget * room / optional_bytes;
+            const uint64_t extra = std::min<uint64_t>((uint64_t) std::min<long double>(room, share),
+                                                       left / stride[c]);
+            plan[c] += (int64_t) extra;
+            left -= extra * stride[c];
+        }
+    }
+    // Spend rounding residue without violating any cap or the byte budget.
+    for (size_t c = 0; c < stride.size(); ++c) {
+        const uint64_t extra = std::min<uint64_t>((uint64_t) (preferred[c] - plan[c]), left / stride[c]);
+        plan[c] += (int64_t) extra;
+        left -= extra * stride[c];
+    }
+    slots.swap(plan);
+    return true;
 }
 
 }  // namespace strata::core::glmfast

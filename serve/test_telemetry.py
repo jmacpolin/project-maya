@@ -203,12 +203,53 @@ class Sampler(unittest.TestCase):
 
     def test_without_nvml(self):
         r = reader(absent=True)
-        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")):   # (nor an AMD card: AmdSysfs has those)
+        # (nor an AMD card: AmdSysfs and AmdWindows have those)
+        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", False):
             t = T.Telemetry(gpu_index=0, reader=r, start=False)
             s = t.sample()
         self.assertEqual((t.static["gpu_name"], t.static["gpu_count"], t.cards), (None, 1, []))
         self.assertNotIn("gpu_util", s)
         self.assertIn("ram_total", s)
+
+    def test_an_idle_unwatched_server_samples_slower_and_wakes_at_a_look(self):
+        """Issue #685: no request and nobody reading the numbers for a while: a reading every IDLE_S, not every second;
+        a read of the numbers (snapshot), a request (touch) or work in hand brings back the second at once."""
+        r = reader(absent=True)
+        busy = [False]
+        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", False):
+            t = T.Telemetry(gpu_index=0, reader=r, start=False, busy=lambda: busy[0])
+        self.assertEqual(t.pause(), 1.0)                       # (just started: watched)
+        t.watched_at -= T.WATCH_S + 1
+        self.assertEqual(t.pause(), T.IDLE_S)                  # unwatched and idle
+        busy[0] = True
+        self.assertEqual(t.pause(), 1.0)                       # a request runs
+        busy[0] = False
+        t.snapshot()
+        self.assertEqual(t.pause(), 1.0)                       # somebody read the numbers
+        self.assertEqual(T.Telemetry(gpu_index=0, reader=r, start=False).pause(), 1.0)   # no busy(): as before
+
+    def test_the_loop_keeps_the_series_a_second_apart_and_wakes_from_its_long_pause(self):
+        import threading
+        import time
+        r = reader(absent=True)
+        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", False), \
+             mock.patch.object(T, "IDLE_S", 3.0), mock.patch.object(T, "WATCH_S", 0.0):
+            t = T.Telemetry(gpu_index=0, reader=r, start=False, busy=lambda: False, extra=lambda: {"tok_s": 7.0})
+            time.sleep(0.01)
+            threading.Thread(target=t._loop, daemon=True).start()
+            time.sleep(0.2)
+            n = len(t.hist["tok_s"])                           # (the first reading; then it pauses IDLE_S)
+            self.assertGreaterEqual(n, 1)
+            self.assertTrue(t._slow)
+            t0 = time.monotonic()
+            t.touch()                                          # a request: the next reading comes now, not in 3 s
+            for _ in range(100):
+                if len(t.hist["tok_s"]) > n:
+                    break
+                time.sleep(0.01)
+            self.assertGreater(len(t.hist["tok_s"]), n)
+            self.assertLess(time.monotonic() - t0, 0.5)
+
 
     def test_gpu_pids(self):
         r = reader()
@@ -306,6 +347,102 @@ class AmdSysfs(unittest.TestCase):
             t = T.Telemetry(gpu_index=0, reader=r, start=False)
         self.assertIsNone(t.amd)
         self.assertEqual(t.static["gpu_name"], "Fake V100")
+
+
+class AmdWindows(unittest.TestCase):
+    """#102 (B): an AMD card on Windows, read from DXGI and Windows' GPU counters (_WinGpu; fake ones here - the
+    real calls are checked on a Windows + AMD PC)."""
+    LUID = "luid_0x00000000_0x0000d1a3"
+    ADAPTERS = [("Intel(R) UHD Graphics", 0x8086, 128 << 20, 0, 0x1111),
+                ("AMD Radeon(TM) 8060S Graphics", 0x1002, 96 << 30, 0, 0xD1A3)]
+
+    class FakePdh:
+        def __init__(self, values):
+            self.v = values
+
+        def ok(self):
+            return True
+
+        def values(self):
+            return self.v
+
+    VALUES = {
+        "engine": [("pid_10_luid_0x00000000_0x0000D1A3_phys_0_eng_0_engtype_3D", 30.0),
+                   ("pid_11_luid_0x00000000_0x0000D1A3_phys_0_eng_0_engtype_3D", 25.5),    # same engine: summed
+                   ("pid_10_luid_0x00000000_0x0000D1A3_phys_0_eng_3_engtype_Compute", 40.0),
+                   ("pid_12_luid_0x00000000_0x00001111_phys_0_eng_0_engtype_3D", 99.0)],   # another adapter
+        "dedicated": [("luid_0x00000000_0x0000D1A3_phys_0", 90.0 * 2**30),
+                      ("luid_0x00000000_0x00001111_phys_0", 1.0 * 2**20)],
+        "shared": [("luid_0x00000000_0x0000D1A3_phys_0", 2.0 * 2**30)]}
+
+    def test_reading_of_one_adapter(self):
+        r = T.win_gpu_reading(self.VALUES, self.LUID)
+        self.assertEqual(r, {"util": 55.5, "mem_used": 90 << 30, "mem_shared": 2 << 30})
+        self.assertEqual(T.win_gpu_reading({}, self.LUID), {"util": None, "mem_used": None, "mem_shared": None})
+
+    def test_card_by_amd_index(self):
+        g = T._WinGpu(0, adapters=self.ADAPTERS, pdh=self.FakePdh(self.VALUES))
+        self.assertTrue(g.ok())
+        self.assertEqual((g.name(), g.pci(), g.luid), ("AMD Radeon(TM) 8060S Graphics", None, self.LUID))
+        r = g.read()
+        self.assertEqual((r["util"], r["mem_used"], r["mem_total"]), (55.5, 90 << 30, 96 << 30))
+        self.assertFalse(T._WinGpu(1, adapters=self.ADAPTERS, pdh=self.FakePdh(self.VALUES)).ok())   # one AMD card
+        self.assertFalse(T._WinGpu(0, adapters=[]).ok())
+
+    # Radeon VII + 2x RX 6800 + Radeon VII: DXGI lists all four; HIP under ROCm 7 runs on the RX 6800s only
+    MIXED = [("AMD Radeon VII", 0x1002, 16 << 30, 0, 0x10617), ("AMD Radeon RX 6800", 0x1002, 16 << 30, 0, 0x13F16),
+             ("AMD Radeon RX 6800", 0x1002, 16 << 30, 0, 0x119A2), ("AMD Radeon VII", 0x1002, 16 << 30, 0, 0xE167)]
+    BUS = {0x10617: 16, 0x13F16: 12, 0x119A2: 9, 0xE167: 6}
+    HIPINFO = ("-" * 80 + "\ndevice#                           0\nName:                             AMD Radeon RX 6800\n"
+               "pciBusID:                         12\npciDomainID:                      0\n"
+               "gcnArchName:                      gfx1030\n" + "-" * 80 + "\n"
+               "device#                           1\nName:                             AMD Radeon RX 6800\n"
+               "pciBusID:                         9\nnon-peers:                        device#0 device#1\n")
+
+    def test_hipinfo_buses(self):
+        self.assertEqual(T.parse_hipinfo_buses(self.HIPINFO), {0: 12, 1: 9})
+        self.assertEqual(T.parse_hipinfo_buses("hipInfo: no devices\n"), {})
+
+    def test_card_by_hip_number_not_dxgi_order(self):
+        def card(i):
+            return T._WinGpu(i, adapters=self.MIXED, pdh=self.FakePdh({}), buses=T.parse_hipinfo_buses(self.HIPINFO),
+                             bus_of=lambda hi, lo: self.BUS.get(lo))
+        self.assertEqual((card(0).name(), card(0).luid), ("AMD Radeon RX 6800", "luid_0x00000000_0x00013f16"))
+        self.assertEqual((card(1).name(), card(1).luid), ("AMD Radeon RX 6800", "luid_0x00000000_0x000119a2"))
+        self.assertFalse(card(2).ok())                   # no HIP GPU 2: no card, not DXGI's third adapter
+        # without hipInfo: DXGI's order, as before
+        g = T._WinGpu(0, adapters=self.MIXED, pdh=self.FakePdh({}), buses={})
+        self.assertEqual(g.luid, "luid_0x00000000_0x00010617")
+
+    def test_hipinfo_without_adapter_buses_keeps_dxgi_order(self):
+        """hipInfo answers but Windows gives no adapter's bus (a driver that refuses the address query): DXGI's order,
+        as before #825 - not no card (a single Halo would otherwise show no GPU in the Monitor)."""
+        buses = T.parse_hipinfo_buses(self.HIPINFO)
+        g = T._WinGpu(0, adapters=self.ADAPTERS, pdh=self.FakePdh(self.VALUES), buses={0: 197},
+                      bus_of=lambda hi, lo: None)
+        self.assertTrue(g.ok())
+        self.assertEqual((g.name(), g.luid), ("AMD Radeon(TM) 8060S Graphics", self.LUID))
+        g = T._WinGpu(1, adapters=self.MIXED, pdh=self.FakePdh({}), buses=buses, bus_of=lambda hi, lo: None)
+        self.assertEqual(g.luid, "luid_0x00000000_0x00013f16")   # DXGI's second AMD adapter, as before
+        # one bus readable is enough to match by bus: an adapter whose bus is unknown is just not that card
+        g = T._WinGpu(0, adapters=self.MIXED, pdh=self.FakePdh({}), buses=buses,
+                      bus_of=lambda hi, lo: 12 if lo == 0x13F16 else None)
+        self.assertEqual(g.luid, "luid_0x00000000_0x00013f16")
+
+    def test_windows_picks_it_when_sysfs_has_no_card(self):
+        fake = T._WinGpu(0, adapters=self.ADAPTERS, pdh=self.FakePdh(self.VALUES))
+        with mock.patch.object(T, "SYSFS", "/nonexistent-sysfs"), mock.patch.object(T, "_WinGpu", return_value=fake), \
+                mock.patch.object(T, "_reader", side_effect=AssertionError("NVML for an AMD card")):
+            with mock.patch.object(T, "WINDOWS", True):
+                t = T.Telemetry(gpu_index=0, amd=True, start=False)
+                s = t.sample()
+                self.assertEqual(T.free_vram_mib(0, amd=True), 6 << 10)
+            self.assertEqual((t.static["gpu_name"], s["gpu_util"], s["gpu_mem_used"], s["gpu_mem_total"]),
+                             ("AMD Radeon(TM) 8060S Graphics", 55.5, 90 << 30, 96 << 30))
+            self.assertIsNone(s.get("gpu_temp"))
+            # Linux keeps the sysfs reader only: no card there means no AMD readings
+            with mock.patch.object(T, "WINDOWS", False):
+                self.assertFalse(T.amd_card(0).ok())
 
 
 if __name__ == "__main__":

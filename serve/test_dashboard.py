@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -69,6 +70,14 @@ class Dashboard(unittest.TestCase):
         s, _, b = self.req("GET", "/health")
         self.assertEqual(json.loads(b)["version"], MAYA_VERSION)
 
+    def test_health_history_thinking(self):
+        """A Qwen3.x template keeps past thinking: the web chat is told to send it back (the GLM-5 one: not)."""
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], True)
+        self.svc.template = ChatTemplate(ROOT / "serve/glm5_chat_template.jinja")
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], False)
+
     def test_context_range(self):
         s, _, b = self.req("GET", "/api/context")
         j = json.loads(b)
@@ -106,6 +115,72 @@ class Dashboard(unittest.TestCase):
         args = json.loads(self.cfg.read_text())["args"]
         self.assertEqual(args[args.index("--max-context") + 1], "65536")
         self.assertEqual(json.loads(self.cfg.read_text())["env"]["STRATA_GLM_RAM_GB"], "20")   # the rest kept
+        self.assertGreaterEqual(j["load_s"], 0.3)       # (how long that load took: the page's estimate of the next)
+        # the setup's own size is kept for the Models page's "Reset to the setup's values", through later reloads
+        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+        self.req("POST", "/api/context", {"max_context": 16384})
+        self.wait_reload()
+        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+
+    def test_metrics_say_whether_deepseek_drafts(self):
+        # DeepSeek's engine does not say it drafts with DSpark: the server does (the Monitor's Speculation), and only
+        # for a DeepSeek config
+        s, _, b = self.req("GET", "/metrics")
+        self.assertNotIn("dspark", json.loads(b)["engine"])
+        for on in (True, False):
+            self.svc.dspark = on
+            s, _, b = self.req("GET", "/metrics")
+            self.assertIs(json.loads(b)["engine"]["dspark"], on)
+
+    def test_metrics_list_the_drafters_that_run(self):
+        # the Monitor's Speculation: the drafters this engine runs with, per model engine; empty = drafting is off
+        from serve.server import request_spec_off, speculation_modes
+        cases = [
+            ({"engine_kind": "glm-fast", "mtp": 1, "dflash": 0}, {}, ["MTP"]),
+            ({"engine_kind": "glm-fast", "mtp": 1, "dflash": 1}, {}, ["DFlash2"]),      # (DFlash decode takes the request first)
+            ({"engine_kind": "glm-fast", "mtp": 0, "dflash": 1}, {}, ["DFlash2"]),
+            ({"engine_kind": "glm-fast", "mtp": 0, "dflash": 0}, {}, []),
+            ({"engine_kind": "qwen", "mtp": 1, "lookup": 3}, {}, ["MTP", "Lookup"]),
+            ({"engine_kind": "qwen", "mtp": 0, "lookup": 0}, {}, []),
+            ({"engine_kind": "mm3", "dspark": 1}, {}, ["DSpark"]),
+            ({"engine_kind": "mm3", "dspark": 0}, {}, []),
+            ({"engine_kind": "ds4"}, {"dspark": True, "lookup": True}, ["DSpark", "Lookup"]),
+            ({"engine_kind": "ds4"}, {"dspark": False, "lookup": True}, ["Lookup"]),
+            ({"engine_kind": "ds4"}, {"dspark": False, "lookup": False}, []),
+        ]
+        for info, kw, want in cases:
+            with self.subTest(info=info, kw=kw):
+                self.assertEqual(speculation_modes(info, **kw), want)
+        self.assertTrue(request_spec_off({"strata_tune": {"spec": 1}}))
+        self.assertFalse(request_spec_off({"strata_tune": {"spec": 4}}))
+        self.assertFalse(request_spec_off({}))
+        self.assertFalse(request_spec_off(None))
+        s, _, b = self.req("GET", "/metrics")
+        self.assertEqual(json.loads(b)["engine"]["speculation"], [])               # (the mock engine drafts nothing)
+        self.engine.info.update(mtp=1)
+        self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["engine"]["speculation"], ["MTP"])
+
+    def test_stat_lines_carry_the_draft_counts_and_the_ssd_bytes(self):
+        # the engines' STAT lines (GLM, CYBER-FROST, DeepSeek, MiniMax): live draft_acc / draft_off and disk_gb reach the
+        # Monitor's tiers.now as numbers
+        class Stub:
+            pass
+        eng = Stub()
+        StrataEngine._parse_stat(eng, "STAT tok_s=31.20 vram_hit=0.9100 vram_used=300 ram_used=500 ram_gb=20.3 "
+                                      "vram_gb=12.5 disk_gb=31.4 draft_acc=124 draft_off=200")
+        self.assertEqual((eng.stat["draft_acc"], eng.stat["draft_off"], eng.stat["disk_gb"]), (124.0, 200.0, 31.4))
+        self.engine.stat = dict(eng.stat)
+        now = json.loads(self.req("GET", "/metrics")[2])["tiers"]["now"]
+        self.assertEqual((now["draft_acc"], now["draft_off"], now["disk_gb"]), (124.0, 200.0, 31.4))
+
+    def test_requests_carry_the_drafts_offered_and_kept(self):
+        # the page's last-answer acceptance: the engine's DONE counts reach the request row, None when it reported none
+        self.engine.last = None
+        self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        row = json.loads(self.req("GET", "/metrics")[2])["requests"][0]
+        self.assertIn("drafts_offered", row)
+        self.assertIn("spec_off", row)
+        self.assertFalse(row["spec_off"])
 
     def test_chat_gets_503_while_reloading(self):
         os.environ["STRATA_MOCK_RELOAD_S"] = "1.5"
@@ -152,6 +227,83 @@ class Dashboard(unittest.TestCase):
         s, _, b = self.req("POST", "/api/tokens", {"messages": msgs + [{"role": "user", "content": [
             {"type": "text", "text": "and this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]}]})
         self.assertTrue(json.loads(b)["approximate"])
+
+    def test_tokenize_and_detokenize(self):
+        """POST /tokenize and /detokenize in llama.cpp's and vLLM's forms: a text's ids (its special tokens' text as
+        those tokens unless parse_special is false), a chat request's prompt as prepare() makes it, and the text back."""
+        tok = ByteTokenizer()
+        s, _, b = self.req("POST", "/tokenize", {"content": "hi<|im_end|>"})
+        self.assertEqual((s, json.loads(b)["tokens"]), (200, tok.encode("hi<|im_end|>", parse_special=True)))
+        s, _, b = self.req("POST", "/tokenize", {"model": "m", "prompt": "hi<|im_end|>", "parse_special": False})
+        j = json.loads(b)
+        self.assertEqual((j["tokens"], j["count"]), (tok.encode("hi<|im_end|>"), len("hi<|im_end|>")))
+        self.assertEqual(j["max_model_len"], self.svc.engine.max_context)
+        msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "count me"}]
+        s, _, b = self.req("POST", "/tokenize", {"messages": msgs, "reasoning_effort": "high"})
+        from serve.frontend import openai_to_messages
+        m, tools, kw = openai_to_messages({"messages": msgs, "reasoning_effort": "high"})
+        ids, _, _ = self.svc.prepare(m, tools, kw)
+        self.assertEqual((s, json.loads(b)["tokens"]), (200, ids))
+        s, _, b = self.req("POST", "/detokenize", {"tokens": ids})
+        j = json.loads(b)
+        self.assertEqual((s, j["content"]), (200, tok.decode(ids)))
+        self.assertEqual(j["prompt"], j["content"])
+        for path, body in (("/tokenize", {"content": 3}), ("/tokenize", {}), ("/detokenize", {"tokens": [1, -1]}),
+                           ("/detokenize", {"tokens": "1,2"})):
+            s, _, _ = self.req("POST", path, body)
+            self.assertEqual(s, 400, (path, body))
+
+    def test_peak_decode_speed(self):
+        # the Monitor's peak decode: the fastest answer since the server started, of PEAK_MIN_TOKENS tokens or more
+        from serve.server import PEAK_MIN_TOKENS
+        s, _, b = self.req("GET", "/metrics")
+        self.assertIsNone(json.loads(b)["totals"]["peak_decode"])
+        end = self.engine.script[-1:]                                  # (its end-of-turn token)
+        self.engine.script = self.engine.scripts[0] = ByteTokenizer().encode("</think>\n\n" + "a long enough answer " * 3) + end
+        self.engine.tok_s = 4000
+        rows = []
+        for _ in range(3):
+            self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+            rows.append(json.loads(self.req("GET", "/metrics")[2])["requests"][0])
+        peak = json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"]
+        top = max(rows, key=lambda r: r["decode_tok_s"])
+        self.assertEqual((peak["tok_s"], peak["tokens"], peak["time"]), (top["decode_tok_s"], top["output_tokens"], top["time"]))
+        self.assertGreaterEqual(peak["tokens"], PEAK_MIN_TOKENS)
+        _, _, b = self.req("GET", "/metrics/prometheus")
+        self.assertIn(f"maya:decode_peak_tokens_seconds {peak['tok_s']}", b.decode())
+        # a short answer, however fast, is not the peak
+        self.engine.tok_s = 400000
+        self.req("POST", "/v1/chat/completions", {"model": "m", "max_tokens": 5,
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"], peak)
+
+    def test_peak_decode_follows_the_live_figure(self):
+        # a live Decode reading above the peak is the peak in the same /metrics answer (the owner's screenshot: 30.0
+        # live, peak 27.8), rounded as shown; a reading before PEAK_MIN_TOKENS tokens is not
+        from serve.server import PEAK_MIN_TOKENS, RequestStat
+        svc, now = self.svc, time.time()
+        svc.totals["peak_decode"] = {"tok_s": 27.8, "tokens": 400, "time": now - 60}
+        r = RequestStat()
+        r.first_token = now - 10
+        with svc.status_lock:
+            svc.status.update(busy=True, generated=PEAK_MIN_TOKENS - 1)
+            svc.current_requests.add(r)
+            svc.latest_request = r
+        try:
+            r.base = (now - 1, 0); r.samples.append((now, PEAK_MIN_TOKENS - 1))   # 31 tok/s, but only 31 tokens
+            m = json.loads(self.req("GET", "/metrics")[2])
+            self.assertEqual(m["totals"]["peak_decode"]["tok_s"], 27.8)
+            for k, n in enumerate((300, 330, 310)):                   # 300, 330, 310 tok/s live, one a reading
+                r.samples.clear(); r.base = (time.time() - 1, 1000 * k); r.samples.append((time.time(), 1000 * k + n))
+                m = json.loads(self.req("GET", "/metrics")[2])
+                self.assertGreaterEqual(m["totals"]["peak_decode"]["tok_s"], m["live"]["tok_s"])
+            self.assertAlmostEqual(m["totals"]["peak_decode"]["tok_s"], 330, delta=2)
+            self.assertEqual(m["totals"]["peak_decode"]["tokens"], 1330)
+            self.assertEqual(round(m["totals"]["peak_decode"]["tok_s"], 1), m["totals"]["peak_decode"]["tok_s"])
+        finally:
+            with svc.status_lock:
+                svc.status.update(busy=False)
+                svc.current_requests.discard(r)
 
     def test_requests_record_their_api(self):
         self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
@@ -257,6 +409,29 @@ class GpuMap(unittest.TestCase):
         self.assertIsNone(self.gm.parse("INFO context=32768"))
         self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
 
+    def test_helper_pool_is_accounted_separately_from_drafter_and_rest(self):
+        helper = 20_000_000_000
+        r = self.gm.parse(f"VRAM dev=2 pci=0000:0f:00.0 total={32 * GB} free={5 * GB} "
+                          f"weights=0 kv=0 act=0 drafter={4 * GB} pool=0 helper={helper} slots=0 layers=-1--1")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual(g["parts"]["helper"], helper)
+        self.assertEqual(g["parts"]["drafter"], 4 * GB)
+        self.assertEqual(g["parts"]["rest"], 23 * GB - helper)
+        self.assertIsNone(g["layers"])
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        merged = self.gm.merge([r, dict(dev=2, helper=1024, free=5 * GB)])
+        self.assertEqual(merged[0]["helper"], helper + 1024)
+
+    def test_helper_pool_and_primary_pool_on_one_card_do_not_overlap(self):
+        r = dict(self.r, helper=2 * GB)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool", "helper"))
+        card = dict(self.card(engine + GB, {100: engine + GB}), total=32 * GB)
+        (g,) = self.gm.view([r], [card], engine_pid=100)
+        self.assertEqual(g["parts"]["helper"], 2 * GB)
+        self.assertEqual(g["parts"]["pool"], r["pool"])
+        self.assertEqual(g["parts"]["rest"], GB)
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+
     def test_nvml_tells_the_engine_from_other_programs(self):
         engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
         own, other = engine + 400 * 2**20, 600 * 2**20
@@ -351,6 +526,21 @@ class GpuMap(unittest.TestCase):
         (h,) = self.gm.view([self.r], [], engine_pid=100)
         self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
 
+    def test_tensor_parallel_room_is_the_groups_least_free(self):
+        # (a --tp 2 pair holds the same expert slots: the 8 GB GPU 1 has beyond GPU 0's 1 GB give no expert more)
+        def line(dev, free, layers):
+            return self.gm.parse(f"VRAM dev={dev} pci=0000:0{dev + 1}:00.0 total={24 * GB} free={free} weights={GB} "
+                                 f"kv=0 kv_ram=0 act=0 drafter=0 window=0 pool={10 * GB} tail=0 borrow=0 vision=0 "
+                                 f"vision_own=0 prompt=0 tp=0 tp_n=2 slots=2000 ctx=65536 layers={layers}")
+        a, b, c, d = self.gm.view([line(0, GB, "0-20"), line(1, 9 * GB, "0-20"), line(2, 5 * GB, "21-42"),
+                                   line(3, 3 * GB, "21-42")], [], engine_pid=100)
+        self.assertEqual((a["tp_group"], b["tp_group"], c["tp_group"], d["tp_group"]), (0, 0, 2, 2))
+        self.assertEqual((a["tp_room"], b["tp_room"]), (a["free"], a["free"]))
+        self.assertGreater(b["free"] - b["tp_room"], 7 * GB)
+        self.assertEqual((c["tp_room"], d["tp_room"]), (d["free"], d["free"]))
+        (h,) = self.gm.view([self.r], [], engine_pid=100)        # (no group: as before)
+        self.assertNotIn("tp_room", h)
+
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)
         b = dict(self.r, layers=[20, 45], slots=700, free=self.r["free"] - GB)
@@ -373,6 +563,21 @@ class GpuMap(unittest.TestCase):
         eng.vram = []
         self.assertIsNone(svc.metrics()["gpu_map"])             # (an engine without VRAM lines: no card)
 
+    def test_later_lines_follow_a_picture(self):
+        """maya-ds4 prints its VRAM lines again when a picture's room is lent to its vision tower and when it is given
+        back: the map of that GPU follows them, the others stay."""
+        from types import SimpleNamespace
+        from serve.server import StrataEngine
+        other = dict(self.r, dev=1, pci="0000:02:00")
+        eng = SimpleNamespace(vram=[self.r, other])
+        lent = LINE.replace("vision=0", "vision=0 vision_own=334495744").replace("pool=15536793108", "pool=15202297364")
+        StrataEngine._vram_line(eng, lent)
+        self.assertEqual((eng.vram[0]["vision_own"], eng.vram[0]["pool"], eng.vram[1]), (334495744, 15202297364, other))
+        StrataEngine._vram_line(eng, LINE)
+        self.assertEqual(eng.vram, [self.r, other])
+        StrataEngine._vram_line(eng, "VRAM nonsense\n")      # (not a GPU's line: nothing changes)
+        self.assertEqual(eng.vram, [self.r, other])
+
 
 class GpuRelease(unittest.TestCase):
     """A reload starts the new engine only once the GPUs have dropped the old one (its memory is freed after it ends)."""
@@ -382,7 +587,8 @@ class GpuRelease(unittest.TestCase):
         from serve import server as SV, telemetry as T
         seen = [{4242, 7}, {4242, 7}, {7}]
         with mock.patch.object(T, "gpu_pids", side_effect=lambda: seen.pop(0) if len(seen) > 1 else seen[0]), \
-                mock.patch.object(SV.time, "sleep") as sleep:
+                mock.patch.object(SV.time, "sleep") as sleep, \
+                mock.patch.object(SV.sys, "platform", "linux"):
             SV.wait_gpu_release(4242, timeout=30)
         self.assertEqual(seen, [{7}])
         self.assertEqual(sleep.call_count, 2)
@@ -390,9 +596,31 @@ class GpuRelease(unittest.TestCase):
     def test_without_nvml_a_short_wait(self):
         from unittest import mock
         from serve import server as SV, telemetry as T
-        with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep:
+        with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep, \
+             mock.patch.object(SV.sys, "platform", "linux"):
             SV.wait_gpu_release(4242)
         sleep.assert_called_once()
+
+    def test_mac_waits_until_free_memory_stops_rising(self):
+        from unittest import mock
+        from serve import server as SV
+        gb = 1 << 30
+        free = [4 * gb, 20 * gb, 40 * gb, 40 * gb, 90 * gb]
+        with mock.patch.object(SV, "mac_free_bytes", side_effect=lambda: free.pop(0)), \
+                mock.patch.object(SV.time, "sleep") as sleep, mock.patch.object(SV.sys, "platform", "darwin"):
+            SV.wait_gpu_release(4242)
+        self.assertEqual(sleep.call_count, 3)                   # rising, rising, settled: started
+        self.assertEqual(free, [90 * gb])
+
+    def test_mac_free_bytes_reads_vm_stat(self):
+        from unittest import mock
+        from serve import server as SV
+        out = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:      10.\n"
+               "Pages active:   99.\nPages inactive:  20.\nPages speculative:  3.\nPages purgeable:  2.\n")
+        with mock.patch.object(SV.subprocess, "run", return_value=mock.Mock(stdout=out)):
+            self.assertEqual(SV.mac_free_bytes(), 35 * 16384)
+        with mock.patch.object(SV.subprocess, "run", return_value=mock.Mock(stdout="")):
+            self.assertIsNone(SV.mac_free_bytes())
 
 
 class NvmlPids(unittest.TestCase):
@@ -429,6 +657,230 @@ class NvmlPids(unittest.TestCase):
             launcher.kill()
             launcher.wait()
             launcher.stdout.close()
+
+
+class Offline(unittest.TestCase):
+    """The page works without the internet: its scripts, styles, fonts and icons are all in serve/web (Preact, htm
+    and Lucide vendored with their notices) - nothing is loaded from another host."""
+    WEB = ROOT / "serve" / "web"
+
+    def test_nothing_loaded_from_the_network(self):
+        import re
+        remote = re.compile(r"""(?:\b(?:src|href|action)\s*=\s*|\burl\(\s*|\bfrom\s+|\bimport\s*\(\s*|"""
+                            r"""\bfetch\(\s*|@import\s+|new\s+(?:WebSocket|EventSource|Worker)\(\s*)["'`]?(?:https?:)?//""",
+                            re.I)
+        found = []
+        for p in sorted(self.WEB.rglob("*")):
+            if p.suffix not in (".js", ".css", ".html", ".svg", ".webmanifest"):
+                continue
+            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                if remote.search(line) and "w3.org/" not in line:
+                    found.append(f"{p.relative_to(ROOT)}:{n}: {line.strip()[:120]}")
+        self.assertEqual(found, [])
+
+    def test_the_vendored_code_keeps_its_notices(self):
+        self.assertIn("The MIT License", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
+        self.assertIn("Apache License, Version 2.0", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
+        self.assertIn("ISC License", (self.WEB / "LICENSE.lucide.txt").read_text(encoding="utf-8"))
+        self.assertTrue((self.WEB / "fonts" / "OFL.txt").is_file())
+        index = (self.WEB.parent / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("fonts.googleapis", index)
+
+
+# the page's own modules in Node (skipped without it), the browser's few globals they touch at load stubbed out
+PAGE_STUBS = """
+const noop = () => {};
+const el = new Proxy({}, {get: (t, k) => (k in t ? t[k] : k === "dataset" || k === "style" ? (t[k] = {})
+  : k === "classList" ? (t[k] = {add: noop, remove: noop, toggle: noop}) : noop)});
+globalThis.matchMedia = () => ({matches: false, addEventListener: noop, addListener: noop});
+globalThis.localStorage = {getItem: () => null, setItem: noop, removeItem: noop};
+globalThis.document = {documentElement: el, body: el, head: el, addEventListener: noop, querySelector: () => null,
+                       createElement: () => el};
+globalThis.window = globalThis; globalThis.addEventListener = noop;
+globalThis.location = {href: "http://x/", hash: "", search: "", pathname: "/"};
+const web = process.argv[2];
+const st = await import(web + "/state.js"), sv = await import(web + "/server.js");
+"""
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "Node.js is not installed")
+class PageLogic(unittest.TestCase):
+    def node(self, body):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.mjs"
+            p.write_text(PAGE_STUBS + body, encoding="utf-8")
+            r = subprocess.run(["node", str(p), (ROOT / "serve" / "web").resolve().as_uri()], capture_output=True,
+                               encoding="utf-8", timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_thinking_pill_covers_the_chosen_level_only(self):
+        # the owner's phone: Low chosen, the fill spanned Off and Low.  Every model's levels, every level: the pill sits
+        # on that level's segment alone
+        got = self.node("""
+const out = {};
+for (const model of ["glm-5.3-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps"]) {
+  st.setFamily(model);
+  out[model] = st.LEVELS.map((l) => [l.id, st.thinkPill(l.id)]);
+}
+console.log(JSON.stringify(out));""")
+        self.assertEqual([lv for lv, _ in got["glm-5.3-flash"]], ["none", "low", "high", "max"])
+        self.assertEqual(len(got["minimax-m3.1-flash"]), 7)
+        for model, levels in got.items():
+            n = len(levels)
+            for i, (lv, pill) in enumerate(levels):
+                with self.subTest(model=model, level=lv):
+                    self.assertEqual((pill["i"], pill["n"]), (i, n))
+                    self.assertAlmostEqual(pill["at"], 100 * i / n)
+                    self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
+        self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
+
+    def test_free_room_a_tensor_parallel_partner_cannot_use_promises_no_experts(self):
+        # a --tp 2 pair: GPU 1 has 9 GB free, GPU 0 (with the drafter) 1 GB - the members hold the same expert slots, so
+        # a restart gives none more; the room is idle, a DSpark block moved there can use it
+        got = self.node("""
+const {freeAdvice} = await import(web + "/monitor.js");
+const G = 2 ** 30, more = (g, b) => Math.max(0, Math.floor(b / (g.parts.pool / g.slots)));
+const where = (gs) => gs.map((g) => "GPU " + g.index).join(" and "), pools = () => "the pools";
+const m = (index, free, room, drafter) => ({index, dev: index, free, tp_room: room, tp_group: 0, slots: 1000,
+                                           parts: {pool: 10 * G, drafter}});
+const pair = [m(0, G, G, G), m(1, 9 * G, G, 0)], both = [m(0, 5 * G, 5 * G, 0), m(1, 7 * G, 5 * G, 0)];
+const plain = [{index: 0, dev: 0, free: 5 * G, slots: 1000, parts: {pool: 10 * G}}];
+console.log(JSON.stringify({
+  pair: freeAdvice([pair[1]], pair, {engine_kind: "ds4"}, where, pools, more),
+  mm3: freeAdvice([pair[1]], pair, {engine_kind: "mm3"}, where, pools, more),
+  both: freeAdvice(both, both, {engine_kind: "ds4"}, where, pools, more),
+  plain: freeAdvice(plain, plain, {engine_kind: "ds4"}, where, pools, more)}));""")
+        self.assertNotIn("restart gives the pools", got["pair"])
+        self.assertIn("GB of GPU 1 sit idle", got["pair"])
+        self.assertIn("MAYA_DS4_DRAFT_DEV", got["pair"])
+        self.assertNotIn("MAYA_DS4_DRAFT_DEV", got["mm3"])
+        # (both have room: 5 GB each grows the pair's slots once - 400 experts, not 800; GPU 1's other 2 GB idle)
+        self.assertIn("are free: a restart gives the pools about 400 more experts.", got["both"])
+        self.assertIn("GB of GPU 1 sit idle", got["both"])
+        self.assertTrue(got["plain"].endswith("GB of GPU 0 are free: a restart gives the pools about 400 more experts."))
+
+    def test_speculation_says_off_waiting_or_the_acceptance(self):
+        # the Monitor's Speculation, three states: off (no drafter, or the request asked for none: "off" in the field and
+        # in the figure), drafting on with nothing drafted yet ("-", never a fake 0%), drafting on with drafts (accepted of
+        # drafted, %) - live from the STAT draft counts, else the last answer's
+        got = self.node("""
+const now = 1000;
+const eng = (modes) => ({speculation: modes});
+const live = (o) => ({state: "generating", elapsed_s: 5, ...o});
+const stat = (o) => ({now: {time: now - 1, ...o}});
+const v = (m) => sv.speculationView(m, now);
+const out = {
+  none: v({engine: eng([]), live: {state: "idle"}, requests: []}),
+  noneLive: v({engine: eng([]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
+  specOne: v({engine: eng(["MTP"]), live: live({spec_off: true}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
+  lastSpecOne: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{spec_off: true, drafts_offered: 0, drafts_accepted: 0}]}),
+  idleNever: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: []}),
+  idleZero: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{drafts_offered: 0, drafts_accepted: 0}]}),
+  idleNull: v({engine: eng(["DFlash2"]), live: {state: "idle"}, requests: [{drafts_offered: null, drafts_accepted: null}]}),
+  liveNone: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
+  liveNoKeys: v({engine: eng(["Lookup"]), live: live({}), tiers: stat({vram_hit: 1}), requests: []}),
+  liveOld: v({engine: eng(["MTP"]), live: live({elapsed_s: 5}), tiers: {now: {time: now - 100, draft_acc: 9, draft_off: 10}}, requests: []}),
+  beforeThis: v({engine: eng(["MTP"]), live: live({elapsed_s: 2}), tiers: {now: {time: now - 20, draft_acc: 9, draft_off: 10}}, requests: []}),
+  live: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 124, draft_off: 200}), requests: []}),
+  liveAllKept: v({engine: eng(["DSpark", "Lookup"]), live: live({}), tiers: stat({draft_acc: 50, draft_off: 50}), requests: []}),
+  liveRatio: v({engine: eng(["DSpark"]), live: live({}), tiers: stat({drafts: 0.5}), requests: []}),
+  zeroKept: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 40}), requests: []}),
+  last: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{drafts_offered: 1200, drafts_accepted: 600}]}),
+  oldServer: v({engine: {}, live: {state: "idle"}, requests: []}),
+};
+console.log(JSON.stringify(out));""")
+        for k in ("none", "noneLive", "specOne"):                              # state 1: off, in the field and the figure
+            self.assertEqual((got[k]["state"], got[k]["name"], got[k]["text"]), ("off", "off", "off"), k)
+        self.assertEqual((got["lastSpecOne"]["state"], got["lastSpecOne"]["name"], got["lastSpecOne"]["text"]),
+                         ("off", "MTP", "off"))                                # (idle: the engine's drafter, the last answer had none)
+        for k in ("idleNever", "idleZero", "idleNull", "liveNone", "liveNoKeys", "liveOld", "beforeThis"):
+            self.assertEqual((got[k]["state"], got[k]["text"]), ("waiting", "\u2014"), k)   # state 2: on, nothing drafted yet
+        self.assertEqual(got["idleNever"]["name"], "MTP")
+        self.assertEqual(got["idleNull"]["name"], "DFlash2")
+        self.assertEqual((got["live"]["state"], got["live"]["text"], got["live"]["name"]), ("kept", "62% (124 of 200)", "MTP"))
+        self.assertEqual(got["liveAllKept"]["text"], "100% (50 of 50)")
+        self.assertEqual(got["liveAllKept"]["name"], "DSpark + Lookup")
+        self.assertEqual(got["liveRatio"]["text"], "50%")                       # (an engine that gives the share only)
+        self.assertEqual(got["zeroKept"]["text"], "0% (0 of 40)")                  # a real 0%: drafted, none kept
+        self.assertEqual(got["last"]["text"], "50% (600 of 1,200)")
+        self.assertEqual(got["oldServer"]["state"], "none")
+
+    def test_experts_on_the_ssd_have_their_bytes_like_the_other_tiers(self):
+        got = self.node("""
+const n = {vram_used: 300, ram_used: 500, vram_gb: 12.5, ram_gb: 20.25, disk_gb: 31.4};
+const ds = {vram_used: 40, ram_used: 100, cpu_n: 400, vram_gb: 9, ram_gb: 25, disk_gb: 75.5};
+console.log(JSON.stringify({glm: sv.tierShares(n, {experts: 2000}), none: sv.tierShares({vram_used: 5, ram_used: 5}, {experts: 10}),
+  ds4: sv.tierShares(ds, {engine_kind: "ds4"}), full: sv.tierShares({vram_used: 10, ram_used: 0, disk_gb: 0}, {experts: 10})}));""")
+        self.assertEqual((got["glm"]["vu"], got["glm"]["ru"], got["glm"]["disk"]), (300, 500, 1200))
+        self.assertEqual((got["glm"]["vramGb"], got["glm"]["ramGb"], got["glm"]["diskGb"]), (12.5, 20.25, 31.4))
+        self.assertEqual((got["ds4"]["total"], got["ds4"]["disk"], got["ds4"]["diskGb"]), (440, 300, 75.5))
+        self.assertIsNone(got["none"]["diskGb"])                                   # (an engine that reports no bytes: the count alone)
+        self.assertEqual((got["full"]["disk"], got["full"]["diskGb"]), (0, 0))
+
+    def test_qwen_file_reads_are_named_for_what_they_count_and_the_ssd_tip_needs_ssd_only_experts(self):
+        # Mercury's Monitor, Qwen3.8 UD-IQ2_XS on 1x V100: 13,199 experts in VRAM, 11,377 in pinned RAM, none on the SSD
+        # alone - but 8.23 experts a token read from the model file; the card said "From SSD" and advised more RAM
+        got = self.node("""
+const m = await import(web + "/monitor.js");
+const q = {engine_kind: "qwen", experts: 24576}, n = {vram_used: 13199, ram_used: 11377, disk: 8.23, vram_hit: 0.93};
+const g = {experts: 2000}, gn = {vram_used: 300, ram_used: 500, disk: 4, vram_hit: 0.9};
+console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glmSet: m.tierSet(g).find((x) => x.key === "disk"),
+  homes: m.tierTip(n, q, {disk: sv.tierShares(n, q).disk}),
+  ssdOnly: m.tierTip({...n, ram_used: 9000}, q, {disk: sv.tierShares({...n, ram_used: 9000}, q).disk}),
+  glm: m.tierTip(gn, g, {disk: sv.tierShares(gn, g).disk}), stale: m.tierTip(gn, g, {disk: 1200, stale: true}),
+  cfCpu: m.tierTip({vram_used: 100, ram_used: 24476, disk: 0, vram_hit: 0.3}, q, {disk: 0})}));""")
+        self.assertEqual(got["set"]["label"], "From the model file")
+        self.assertIn("page cache or SSD", got["set"]["sub"])
+        self.assertEqual(got["glmSet"]["label"], "From SSD")                    # (GLM's own reads: unchanged)
+        self.assertEqual(got["homes"], "")                                      # every expert has a home: no "more RAM"
+        self.assertTrue(got["ssdOnly"].startswith("Many experts are read from the SSD"))   # 2,377 on the SSD alone
+        self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
+        self.assertEqual(got["stale"], "")
+        self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
+    def test_about_has_the_support_line_always_and_the_update_card_none(self):
+        # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold
+        # violet; no row under an update's button; the sidebar's heart stays
+        web = ROOT / "serve" / "web"
+        js = (web / "settings.js").read_text(encoding="utf-8")
+        line = js[js.index("const SupportLine"):js.index("function UpdateCard")]
+        body = line.split("<span>", 1)[1].split("</span></p>", 1)[0].replace('${" "}', " ")
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", body))
+        self.assertEqual(text, "I build Maya because I believe everyone should have access to great local AI. If you enjoy "
+                               "what I'm building, consider supporting me. Every little bit helps keep the project alive "
+                               "and growing. ❤️")
+        self.assertRegex(line, r'<a class="support-link" href=\$\{SUPPORT_URL\} target="_blank" rel="noopener"\s+'
+                               r'title="[^"]*">supporting me</a>')
+        self.assertNotIn('name="heart"', line)                               # (no second heart before the text)
+        card = js[js.index("function UpdateCard"):js.index("\n}\n", js.index("function UpdateCard"))]
+        self.assertNotIn("SupportLine", card)
+        self.assertIn("<${UpdateCard}/>\n    <${SupportLine}/>", js)               # (About: always, under the update)
+        css = (web / "settings.css").read_text(encoding="utf-8")
+        rule = re.search(r"\.set-support \.support-link \{([^}]*)\}", css).group(1)
+        self.assertIn("font-weight: 700", rule)
+        self.assertIn("color: var(--st-accent-text)", rule)
+        self.assertEqual(len(re.findall(r"--st-accent-text:\s*#", (web / "tokens.css").read_text(encoding="utf-8"))), 2)
+        self.assertIn("heart-link", (web / "sidebar.js").read_text(encoding="utf-8"))   # (the sidebar's heart stays)
+
+    def test_context_slider_reaches_each_models_own_top(self):
+        # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
+        # 1M), the size a config has kept as a stop of its own
+        got = self.node("""
+const r1m = {min: 4096, max: 1048576}, r256 = {min: 4096, max: 262144};
+st.S.ctxInfo = {...r1m, context: 131072};
+console.log(JSON.stringify({m1: sv.ctxStopsIn(r1m, 131072), m256: sv.ctxStopsIn(r256, 131072, 100000),
+                            settings: sv.ctxStops(), none: sv.ctxStopsIn(null, 1),
+                            win: sv.ctxHint(16384, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES}),
+                            past: sv.ctxHint(131072, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES})}));""")
+        self.assertEqual((got["m1"][0], got["m1"][-1]), (4096, 1048576))
+        self.assertEqual(got["m1"], got["settings"])                     # (the same stops as Settings > Model's)
+        self.assertEqual(got["m256"][-1], 262144)
+        self.assertIn(100000, got["m256"])
+        self.assertEqual(got["none"], [])
+        self.assertEqual(got["win"], "Up to 32K the whole cache stays in VRAM.")
+        self.assertTrue(got["past"].startswith("≈ 1.5 GB of RAM for the context"), got["past"])
 
 
 if __name__ == "__main__":

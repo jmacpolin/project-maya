@@ -17,6 +17,7 @@ import setup as S  # noqa: E402
 from setup_bridge import Bridge  # noqa: E402
 try:
     from rich.console import Console
+    from rich.text import Text
     import setup_dash as D
     import setup_tui as T
 except ImportError:
@@ -94,7 +95,7 @@ class Boxes(unittest.TestCase):
 
     def test_gpus_hardware_requests_and_banners(self):
         gpus = text(D.gpus(METRICS))
-        for want in ("RTX 5060 Ti", "RTX 3090", "41%", "14.0 / 16 GB", "88 / 180 W", "Gen5 x8", "3,100 MB/s"):
+        for want in ("RTX 5060 Ti", "RTX 3090", "41%", "14.0 / 16 GB", "88 / 180 W", "Gen5 x8", "3.0 GB/s"):
             self.assertIn(want, gpus)
         hw = text(D.hardware(METRICS, 116))
         for want in ("GPU load", "41%", "28.0 / 32 GB", "5,248 experts cached", "CPU", "88 cores", "RAM",
@@ -105,6 +106,16 @@ class Boxes(unittest.TestCase):
             self.assertIn(want, reqs)
         self.assertIn("GPU 1 is at 88 °C", D.banners(METRICS, 0).plain)
         self.assertIn("does not answer", D.banners(METRICS, 3).plain)
+
+    def test_gpu_columns_keep_their_place_when_a_reading_changes(self):   # (#793: a PCIe burst moved the others)
+        def cols(rx, power, used):
+            g = dict(GPU, pcie_rx_mb=rx, power=power, mem_used=used)
+            m = dict(METRICS, hardware=dict(METRICS["hardware"], gpus=[g]))
+            line = text(D.gpus(m), 120).rstrip().splitlines()[-1]
+            return line.index(" / "), line.index(" W"), len(line.rstrip())
+        quiet = cols(0.4, 88.0, 9.5 * 2**30)
+        for rx, power, used in ((204789.0, 88.0, 9.5 * 2**30), (3100.0, 100.0, 9.5 * 2**30), (12.0, 9.0, 10.0 * 2**30)):
+            self.assertEqual(cols(rx, power, used), quiet, (rx, power, used))
 
     def test_an_empty_server_is_no_error(self):            # (before the first request, or a server just started)
         empty = {"engine": {}, "live": {"state": "idle"}, "hardware": {}, "history": {}}
@@ -119,6 +130,16 @@ class Boxes(unittest.TestCase):
         self.assertIn("RTX 3090", text(D.gpus(m)))
         self.assertIn("28.0 / 32 GB", text(D.gpus(m)))
         self.assertIn("383", text(D.requests(m, 116)))          # 1,533 tokens read in 4 s
+
+    def test_a_boxes_shape_is_what_decides_its_layout(self):   # (put: laid out again only when it changes)
+        a, b = D.speed(METRICS, 50), D.speed(dict(METRICS, live=dict(METRICS["live"], tok_s=31.0)), 50)
+        self.assertEqual(D.shape(a), D.shape(b))                # a new reading of the same box: the same shape
+        self.assertIsNotNone(D.shape(a))
+        self.assertIsNotNone(D.shape(D.gpus(METRICS)))
+        self.assertNotEqual(D.shape(D.gpus(METRICS)), D.shape(D.gpus(dict(METRICS, hardware=dict(METRICS["hardware"], gpus=[GPU])))))
+        self.assertEqual(D.shape(Text("a\nb")), 1)
+        self.assertIsNone(D.shape("not a renderable we know"))
+
 
     def test_the_engines_facts_come_as_text(self):           # (its INFO line: "ram_gb": "107.8", as the server sends)
         m = dict(METRICS, engine=dict(METRICS["engine"], ram_gb="107.8", vram_gb="12.3"))
@@ -159,6 +180,63 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.1)
                     self.assertIsNone(app.view)
                     self.assertTrue(dash.display)
+                    await pilot.press("ctrl+c", "ctrl+c")
+                bridge.finish(10)
+            finally:
+                S.UI = None
+                bridge.log.close()
+
+
+@unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")
+class IdleScreen(unittest.IsolatedAsyncioTestCase):
+    """Issue #685: a screen with Maya ready and no request does as little as it shows - the card's clock once a second
+    (not the spinner's eight), the setup's events looked for less often, and a new reading of the dashboard's boxes
+    drawn without laying the whole screen out again."""
+
+    async def test_ready_and_quiet_slows_the_timers_and_lays_out_rarely(self):
+        server = "import time\nprint('ready: http://127.0.0.1:9/v1')\ntime.sleep(60)"
+        info = {"model": "glm-5.3-flash", "quant": "Maya-L", "context": "32768", "dashboard": "http://127.0.0.1:9/",
+                "api": "http://127.0.0.1:9/v1", "log": None, "key": ""}
+        with tempfile.TemporaryDirectory() as d:
+            bridge = Bridge(Path(d) / "setup.log")
+            S.UI = bridge
+            app = T.SetupApp(bridge, lambda: S.UI.serve([sys.executable, "-c", server], dict(os.environ, PYTHONUNBUFFERED="1"),
+                                                        info), "1.0", "./maya.sh", Path(d) / "setup.log")
+            try:
+                async with app.run_test(size=(120, 40)) as pilot:
+                    t0 = time.time()
+                    while app.state[T.SERVE] != "ready":
+                        self.assertLess(time.time() - t0, 20, "the stand-in server did not get ready")
+                        await pilot.pause(0.05)
+                    self.assertFalse(app.animating())
+                    await pilot.pause(1.6)
+                    self.assertEqual(app.tick_every, T.IDLE_TICK_S)             # the clock: once a second
+                    self.assertEqual(app.drain_every, T.IDLE_DRAIN_S)           # nothing comes in: four looks a second
+                    # a model loading again moves the spinner: the timer is quick at once
+                    app.serving["state"] = "Reloading the model"
+                    self.assertTrue(app.animating())
+                    app.set_tick(T.TICK_S)
+                    self.assertEqual(app.tick_every, T.TICK_S)
+                    app.serving["state"] = "ready"
+                    # the dashboard's boxes: the same shape is only drawn, a new one (or every tenth reading) laid out
+                    dash = app.query_one(T.Dashboard)
+                    seen = []
+                    real = T.Dashboard.put.__globals__["Static"].update
+                    def spy(widget, content="", *, layout=True):
+                        seen.append((widget.id, layout))
+                        return real(widget, content, layout=layout)
+                    with patch.object(T.Dashboard.put.__globals__["Static"], "update", spy):
+                        dash.puts.clear()
+                        dash.shapes.clear()
+                        for _ in range(12):
+                            dash.put("#dash-gpus", D.gpus(METRICS))
+                        one = [lay for i, lay in seen if i == "dash-gpus"]
+                        self.assertEqual(one[0], True)                          # the first: no shape known yet
+                        self.assertEqual(one[1:9], [False] * 8)                 # the same shape: drawn only
+                        self.assertEqual(one[9], True)                          # every tenth: laid out all the same
+                        seen.clear()
+                        dash.put("#dash-gpus", D.gpus(dict(METRICS, hardware=dict(METRICS["hardware"], gpus=[GPU]))))
+                        self.assertEqual([lay for i, lay in seen], [True])      # fewer cards: a new shape
                     await pilot.press("ctrl+c", "ctrl+c")
                 bridge.finish(10)
             finally:
@@ -220,12 +298,12 @@ class Loading(unittest.TestCase):
 
 @unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")
 class Start(unittest.IsolatedAsyncioTestCase):
-    """./maya.sh on an installed Maya: the real engine (server.py --engine strata) on the screen - its dashboard and
+    """./maya.sh on an installed Maya: the real engine (server.py --engine maya) on the screen - its dashboard and
     log, without the setup's steps or its log; --plain (or no terminal): in the terminal as before."""
 
     async def test_a_start_runs_the_engine_on_the_screen(self):
         got, served = {}, []
-        cmd = [sys.executable, "serve/server.py", "--engine", "strata", "--config", "maya-test.json"]
+        cmd = [sys.executable, "serve/server.py", "--engine", "maya", "--config", "maya-test.json"]
         ui = SimpleNamespace(serve=lambda c, env, info: served.append((c, info)) or 0)
 
         def run(body, version, log_path, me, steps=True):

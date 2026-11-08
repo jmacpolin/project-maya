@@ -1,6 +1,6 @@
 """tools/ds4/pack_gguf.py - the engine's pack for a DeepSeek-V4.1 GGUF (unsloth's DeepSeek-V4.1-Flash-1017 UD-Q8_K_XL
-and the like: dense BF16, routed experts MXFP4, Engram tables MXFP8 or Q6_K), beside the model's files (no weights
-copied).
+and the like: dense BF16, routed experts MXFP4, Engram tables MXFP8, Q6_K, Q5_K or IQ4_NL), beside the model's files
+(no weights copied).
 
     python tools/ds4/pack_gguf.py --model ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL
 
@@ -34,7 +34,7 @@ import sys
 
 TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17),
          67: ("MXFP8", 32, 33),          # ggml type -> (name, values a block, bytes a block); 67: unsloth's fork
-         43: ("MXFP8", 32, 33),          # llama.cpp's own id (unsloth's GGUFs from 2026-10-19 on)
+         43: ("MXFP8", 32, 33),          # unsloth's GGUFs from 2026-10-19 on (upstream's 43 is F8_E4M3: Gguf._type43)
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
@@ -71,6 +71,25 @@ class Gguf:
             pos = f.tell()
             self.data_start = (pos + align - 1) // align * align
         del self.f
+        self._type43(align)
+
+    def _type43(self, align: int):
+        """ggml type 43 means two things: unsloth's MXFP8 (33 bytes a 32 values: its GGUFs' Engram tables, every
+        revision so far) and, in upstream llama.cpp since, F8_E4M3 (one byte a value, no block scales).  The bytes a
+        tensor spans tell them apart: up to the next tensor, or (the last one) the file's end - a file still downloading
+        is never taken for the second (its span is not within an alignment of one byte a value)."""
+        offs = sorted(t[3] for t in self.tensors)
+        for name, typ, dims, off in self.tensors:
+            if typ != 43:
+                continue
+            nel = 1
+            for d in dims:
+                nel *= d
+            later = [o for o in offs if o > off]
+            span = (later[0] if later else self.path.stat().st_size - self.data_start) - off
+            if nel <= span < nel + align and span < nel // 32 * 33:
+                raise SystemExit("%s: %s is in upstream llama.cpp's F8_E4M3 (ggml type 43, one byte a value without "
+                                 "block scales) - the pack reads type 43 as unsloth's MXFP8 only" % (self.path.name, name))
 
     def _str(self):
         n = struct.unpack("<Q", self.f.read(8))[0]
@@ -191,6 +210,46 @@ def geometry(kv: dict, vocab: int) -> dict:
     if clamp and any(abs(c - clamp[0]) > 1e-6 for c in clamp):
         raise SystemExit("swiglu_clamp_exp differs between layers %s: the engine takes one swiglu_limit" % clamp[:8])
     return out
+
+
+# DeepSeek-V4.1-Flash's own DSpark geometry (its checkpoint's config.json - the drafter drafter_pack.py builds is that
+# checkpoint's), for a GGUF of it that leaves the keys out: ISTA's GSQ-RCO carries only the target layers (#500), and a
+# drafter packed with block size 0 loads, VRAM and all, and never drafts.  The trunk it is for, as the GGUF gives it.
+DSPARK_KEYS = ("dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank", "dspark_n_routed_experts",
+               "dspark_num_experts_per_tok", "dspark_target_layer_ids")
+DSPARK_V41_FLASH = {"dspark_block_size": 5, "dspark_noise_token_id": 128799, "dspark_markov_rank": 256,
+                    "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3,
+                    "dspark_target_layer_ids": [37, 38, 39]}
+V41_FLASH_TRUNK = {"hidden_size": 5120, "num_hidden_layers": 40, "n_routed_experts": 384}
+
+
+def drafter_experts(info: dict):
+    """The routed experts of the drafter's first block (its .json's tensor names), or None when it names none."""
+    ids = [int(m.group(1)) for m in (re.match(r"mtp\.0\.ffn\.experts\.(\d+)\.", t[0]) for t in info.get("tensors", []))
+           if m]
+    return max(ids) + 1 if ids else None
+
+
+def dspark_fill(geo: dict, info: dict, vocab: int):
+    """The DSpark keys geo (the GGUF's) lacks or has as 0, for the drafter `info` (its .json): from that .json's own
+    "config" (drafter_pack.py writes the checkpoint's when its config.json is beside the shards), else
+    DeepSeek-V4.1-Flash's when the trunk and the drafter are that model's.  (values, where from), or (None, the keys
+    missing) when nothing gives them - the drafter would never draft."""
+    missing = [k for k in DSPARK_KEYS if not geo.get(k)]
+    if not missing:
+        return {}, None
+    own = info.get("config") or {}
+    fill = {k: own[k] for k in missing if own.get(k)}
+    src = "the drafter's .json" if fill else ""
+    rest = [k for k in missing if k not in fill]
+    flash = all(geo.get(k) == v for k, v in V41_FLASH_TRUNK.items()) and vocab > DSPARK_V41_FLASH["dspark_noise_token_id"]
+    if rest and flash and drafter_experts(info) in (None, DSPARK_V41_FLASH["dspark_n_routed_experts"]):
+        fill.update({k: DSPARK_V41_FLASH[k] for k in rest})
+        src += (" and " if src else "") + "DeepSeek-V4.1-Flash's own values"
+        rest = []
+    if rest:
+        return None, rest
+    return fill, src
 
 
 def ple_to_engram(kv: dict):
@@ -372,7 +431,12 @@ def main() -> int:
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
+    ap.add_argument("--without", nargs="+", default=[],
+                    help="shards of the split left out on purpose: they hold only its Engram tables, which --engram's "
+                         "set gives instead (orcarouter's shard 2: the setup takes Maya's Q6_K tables for it)")
     a = ap.parse_args()
+    if a.without and not a.engram:
+        raise SystemExit("--without: the Engram tables then come from --engram's set - name it")
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
     shards = [model / n for n in a.shards] if a.shards else sorted(model.glob("*.gguf"))
@@ -387,7 +451,10 @@ def main() -> int:
     if kv is None or kv["general.architecture"] not in ("deepseek41",):
         raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, kv and kv.get("general.architecture")))
     split = int(kv.get("split.count", 1))
-    if split != len(gs):
+    if a.without and (any(n in [p.name for p in shards] for n in a.without) or
+                      any(not re.search(r"-of-%05d\.gguf$" % split, n) for n in a.without)):
+        raise SystemExit("--without %s: not shards of this %d-shard split left out" % (" ".join(a.without), split))
+    if split != len(gs) + len(a.without):
         counts = sorted({m.group(1) for m in (re.search(r"-of-(\d{5})\.gguf$", p.name) for p in shards) if m})
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split) if len(counts) < 2 else
                          "%s: the shards of more than one GGUF split (-of-%s): name the model's own with --shards" %
@@ -501,10 +568,25 @@ def main() -> int:
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
     drafter_in = drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
+    geo = geometry(kv, vocab)
+    dinfo = json.loads(drafter.read_text()) if drafter_in else {}
+    if drafter_in:   # (its geometry: the GGUF's, else filled in - a drafter without it never drafts: left out, said so)
+        fill, src = dspark_fill(geo, dinfo, vocab)
+        if fill is None:
+            print("WARNING: the DSpark drafter %s is left out of the pack: the GGUF has no %s for it (and this is not "
+                  "DeepSeek-V4.1-Flash's trunk, whose own values the pack would take) - with them 0 the engine would "
+                  "load the drafter and never draft.  Drafting stays off; a GGUF with the dspark.* metadata drafts"
+                  % (drafter, ", ".join(src)), file=sys.stderr)
+            drafter_in = False
+        elif fill:
+            geo.update(fill)
+            print("DSpark geometry not in the GGUF, taken from %s: %s" %
+                  (src, ", ".join("%s %s" % (k, fill[k]) for k in DSPARK_KEYS if k in fill)))
     if drafter_in:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
-        for name, dt, off, nb, shape in json.loads(drafter.read_text())["tensors"]:
+        for name, dt, off, nb, shape in dinfo["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
                 for i in range(groups):
                     tensors.append(("%s.slice.%d.weight" % (name[:-len(".weight")], i), dt, len(files) - 1,
@@ -527,8 +609,6 @@ def main() -> int:
         for name, dt, off, nb, shape in info["tensors"]:
             tensors.append((name, dt, len(files) - 1, off, nb, shape))
         vision = info["config"]
-    vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
-    geo = geometry(kv, vocab)
 
     out.mkdir(parents=True, exist_ok=True)
     with (out / "ds4.txt").open("w") as f:

@@ -15,7 +15,8 @@ import unittest
 from pathlib import Path
 
 from serve import ds41_encoding as reference, ds4_vision
-from serve.frontend import ChatTemplate, OutputParser, anthropic_to_messages, deepseek_images, openai_to_messages
+from serve.frontend import (ChatTemplate, OutputParser, _TOOL_ORDERS, _TOOL_ORDERS_LOCK,
+                            anthropic_to_messages, deepseek_images, openai_to_messages)
 from serve.server import (ByteTokenizer, MockEngine, Service, anthropic_collect, anthropic_events,
                           openai_chunks, openai_collect)
 
@@ -47,7 +48,16 @@ def dsml(parameters, name="lookup"):
             + '\n</｜DSML｜ invoke>\n</｜DSML｜ calls>')
 
 
-class Rendering(unittest.TestCase):
+class _CleanToolOrders(unittest.TestCase):
+    # stable_tool_order's memory is process-global and the DeepSeek converters use it
+    # now, so a golden repeating a tool-name set in another order would render in whichever order an
+    # earlier test (in this process, any file) first sent.  Goldens must not depend on test order.
+    def setUp(self):
+        with _TOOL_ORDERS_LOCK:
+            _TOOL_ORDERS.clear()
+
+
+class Rendering(_CleanToolOrders):
     @classmethod
     def setUpClass(cls):
         cls.template = ChatTemplate(ROOT / "tools/ds4/chat_template.jinja")
@@ -147,6 +157,57 @@ class Rendering(unittest.TestCase):
             with self.subTest(effort=effort, location="direct"):
                 with self.assertRaises(ValueError):
                     self.template.render(BASE, reasoning_effort=effort)
+
+    def test_config_numeric_string_is_an_effort_level(self):   # (#768: "reasoning_effort": "42" in the run config)
+        from serve.frontend import config_budget, deepseek_effort_kwargs
+        self.assertEqual(deepseek_effort_kwargs(config_budget("42")), {"reasoning_effort": 42})
+        self.assertEqual(deepseek_effort_kwargs(config_budget(" 7 ")), {"reasoning_effort": 7})
+        self.assertEqual(config_budget("high"), "high")
+        self.assertEqual(config_budget(42), 42)
+        for bad in ("0", "101", "unknown", "4.5", "-3"):   # out of range, a word, not a whole number
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                deepseek_effort_kwargs(config_budget(bad))
+
+    def test_config_effort_by_family(self):   # (#807: a number meant as tokens is pointed to thinking_budget)
+        from serve.frontend import config_effort
+        for value, kept in (("42", 42), (42, 42), ("100", 100), ("1", 1), ("high", "high"), ("none", "none"),
+                            ("auto", "auto")):
+            with self.subTest(value=value):
+                self.assertEqual(config_effort(value, deepseek=True), kept)
+        for value in ("4096", 4096, "101", 32768):
+            with self.subTest(value=value), self.assertRaises(ValueError) as e:
+                config_effort(value, deepseek=True)
+            self.assertIn("thinking_budget", str(e.exception))
+            self.assertIn("[1, 100]", str(e.exception))
+        for value in ("0", 0, "-3", "unknown"):   # (not a token count: the plain range message)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                config_effort(value, deepseek=True)
+        for value in ("max", "low", "xhigh", "auto"):   # every other model: the named levels
+            with self.subTest(value=value):
+                self.assertEqual(config_effort(value, deepseek=False), value)
+        for value in ("4096", 4096, "42", 42, 1.5, "8192.0"):
+            with self.subTest(value=value), self.assertRaises(ValueError) as e:
+                config_effort(value, deepseek=False)
+            self.assertIn("thinking_budget", str(e.exception))
+        with self.assertRaises(ValueError) as e:
+            config_effort("loud", deepseek=False)
+        self.assertNotIn("thinking_budget", str(e.exception))
+
+    def test_config_effort_checked_before_the_model_loads(self):   # (#807)
+        import inspect
+        from serve import server
+        ds4 = ChatTemplate(ROOT / "tools/ds4/chat_template.jinja")
+        glm = ChatTemplate(ROOT / "serve/glm5_chat_template.jinja")
+        self.assertEqual(server.checked_config_effort({"reasoning_effort": "42"}, ds4, True)["reasoning_effort"], 42)
+        self.assertEqual(server.checked_config_effort({}, glm, False), {})   # (the mock: none given, none set)
+        with self.assertRaises(SystemExit) as e:
+            server.checked_config_effort({"reasoning_effort": "4096"}, ds4, True)
+        self.assertIn("thinking_budget", str(e.exception.code))
+        with self.assertRaises(SystemExit):
+            server.checked_config_effort({"reasoning_effort": "4096"}, glm, True)
+        # main(): the check comes before the engine (the model's load) is started
+        src = inspect.getsource(server.main)
+        self.assertLess(src.index("checked_config_effort("), src.index("StrataEngine("))
 
     def test_thinking_disabled_omits_budget(self):
         for options in ({"reasoning_effort": "none"}, {"reasoning_effort": False},
@@ -257,7 +318,7 @@ class Rendering(unittest.TestCase):
                         self.assertTrue(closed.endswith(header + marker))
 
 
-class Parsing(unittest.TestCase):
+class Parsing(_CleanToolOrders):
     def test_official_fixture_completions_at_chunk_boundaries(self):
         for number in range(1, 6):
             text = (FIXTURES / f"test_output_{number}.txt").read_text(encoding="utf-8")
@@ -332,6 +393,30 @@ class Parsing(unittest.TestCase):
                         events = parse(text, thinking=thinking, stream=stream, step=step)
                         self.assertEqual("".join(e.text for e in events if e.kind == "content"), "\n\nanswer")
 
+    def test_a_quoted_end_tag_does_not_end_the_reasoning(self):
+        # the vocabulary has the end of thinking as a token, so the text form is the model's own text, not a marker:
+        # reasoning that quotes the tag (the server's own code does) must not spill into the answer there
+        tag = "</think>"
+        for step in (1, 3, len(tag) + 9):
+            with self.subTest(step=step):
+                parser = OutputParser(thinking=True, dsml=True, token_only_end=True)
+                events = []
+                text = "it is written " + tag + " in the prompt"
+                for i in range(0, len(text), step):
+                    events.extend(parser.feed(text[i:i + step]))
+                self.assertEqual(parser.state, "reasoning")
+                self.assertEqual("".join(e.text for e in events), text)          # (kept, not swallowed)
+                # ... and the token closes it: what follows is the answer's
+                events = parser.close_reasoning() + parser.feed("the answer")
+                self.assertEqual(parser.state, "content")
+                self.assertEqual([e.kind for e in events], ["content"])
+                self.assertEqual(events[0].text, "the answer")
+        # a template whose end is text (GLM's, Qwen's) is unchanged: the tag there does end the reasoning
+        parser = OutputParser(thinking=True)
+        events = parser.feed("quote " + tag + " answer")
+        self.assertEqual(parser.state, "content")
+        self.assertEqual([(e.kind, e.text) for e in events], [("reasoning", "quote "), ("content", " answer")])
+
     def test_long_string_argument_streams_before_its_closing_tag(self):
         # issue #403: a file's content (string="true") goes out as the model writes it, not at its closing tag;
         # the pieces join to the same JSON as the whole call, a string="false" value still arrives whole
@@ -366,8 +451,49 @@ class Parsing(unittest.TestCase):
             if stream:
                 self.assertEqual(next(e.call.id for e in events if e.kind == "tool_start"), call.id)
 
+    def test_streamed_string_parameter_bytes_arrive_before_the_call_ends(self):
+        """A string parameter's argument deltas must flow while it is being written, not only once its
+        closing tag arrives (pi-ai streamIdleTimeoutMs 300000 ms: a buffered 10k-token `write` was
+        byte-silent for minutes and every long tool call timed out)."""
+        big = "\n".join(f"stanza {i} about the sea" for i in range(400))   # ~8k chars
+        text = dsml(f'<｜DSML｜ parameter name="q" string="true">{big}</｜DSML｜ parameter>')
+        for step in (1, 7, 64, len(text)):
+            with self.subTest(step=step):
+                events = parse(text, stream=True, step=step)
+                args = [e for e in events if e.kind == "tool_args"]
+                self.assertTrue(args)
+                self.assertTrue(any(len(e.text) > 1 for e in args), "no argument piece moved early")
+                # a piece before the final tool_call event: bytes flowed while the call was open
+                last_call = max(i for i, e in enumerate(events) if e.kind == "tool_call")
+                self.assertLess(max(i for i, e in enumerate(events) if e.kind == "tool_args"), last_call)
+                self.assertEqual(json.loads("".join(e.text for e in args)), {"q": big})
 
-class ResponseSerialization(unittest.TestCase):
+    def test_streamed_parameter_never_splits_a_closing_tag(self):
+        """Streamed value pieces must never leak a partial structural token: a closing-tag PREFIX at
+        the end of a piece stays held until it resolves as data. (A COMPLETE embedded closing tag is
+        structural in the reference decoder too - not data - so it is not tested as data here.)"""
+        for value in ("ends with a lone lt <", "ends with </\uff5cDSML\uff5c para",
+                      "ends with </\uff5cDSML\uff5c parameter", "two lines\nand < chars <", "clean text"):
+            with self.subTest(value=value):
+                text = dsml(f'<｜DSML｜ parameter name="q" string="true">{value}</｜DSML｜ parameter>')
+                events = parse(text, stream=True, step=1)
+                streamed = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(streamed), {"q": value})
+                calls = [e.call for e in events if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1)
+
+    def test_streamed_raw_parameter_stays_whole(self):
+        """string="false" values (numbers/bools/objects) keep the whole-value path: they are short and
+        must arrive as one JSON scalar, byte-identical to the unstreamed parse."""
+        text = dsml('<｜DSML｜ parameter name="q" string="false">{"nested": [true, null, 2]}</｜DSML｜ parameter>')
+        for step in (1, 7, len(text)):
+            with self.subTest(step=step):
+                events = parse(text, stream=True, step=step)
+                self.assertEqual(json.loads("".join(e.text for e in events if e.kind == "tool_args")),
+                                 {"q": {"nested": [True, None, 2]}})
+
+
+class ResponseSerialization(_CleanToolOrders):
     def service(self):
         tok = ByteTokenizer()
         script = "reason</think>" + dsml(
@@ -413,7 +539,7 @@ class ResponseSerialization(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "tool_use")
 
 
-class ServiceIntegration(unittest.TestCase):
+class ServiceIntegration(_CleanToolOrders):
     class DeepSeekTokenizer(ByteTokenizer):
         SPECIALS = ByteTokenizer.SPECIALS + [
             reference.bos_token, reference.eos_token, "<｜User｜>", "<｜Assistant｜>", "<｜System｜>",
@@ -541,7 +667,7 @@ class ServiceIntegration(unittest.TestCase):
                         self.assertEqual(result["stop_reason"], "tool_use")
 
 
-class Images(unittest.TestCase):
+class Images(_CleanToolOrders):
     def test_parallel_result_images_follow_reference_call_order_without_mutation(self):
         request = {"messages": BASE + [
             {"role": "assistant", "content": "", "tool_calls": [tool_call("a", "alpha"), tool_call("b", "beta")]},

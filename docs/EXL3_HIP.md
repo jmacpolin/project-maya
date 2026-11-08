@@ -1,10 +1,10 @@
-# Experimental EXL3 prefill on HIP
+# EXL3 prefill on HIP
 
 The portable HIP implementations of `exl3::set_gate_up`, `set_down`, and `gemm_rows` reuse the existing eight-activation `block_gemv` decoder. They replace the previous no-op HIP branches. They use FP32 FMA arithmetic, not AMD matrix instructions; there is room for further optimization. The FP16 input adapter is separate from the original decode input structure. CUDA keeps its existing tensor-core implementation.
 
-## Current limits
+## In the setup
 
-This is kernel bring-up, not general installer support. The setup still rejects DeepSeek EXL3 on HIP. Prepare the pack manually and use a direct engine launch or a separate server configuration. Do not remove that installer check until broader model validation is complete. Vision and DSpark were disabled in the full-model trial. NVIDIA build/runtime checks and independent full-model EXL3 parity remain outstanding.
+The setup offers DeepSeek's EXL3 quants on AMD (since v1.1.30), as it offers GLM's and MiniMax's EXL3 quants there: `--backend hip --model DeepSeek-V4.1-Flash-1017 --ds4-quant exl3` (or `exl3-3.5`) downloads, packs and configures them. The kernels pass `exl3_test` on gfx1201 and gfx1151. The manual steps below still work for a direct engine launch.
 
 The EXL3 3.5bpw model has integer per-matrix K (3/4 for routed experts, 6 for most dense matrices). Its average bitrate does not require half-integer matrix encodings. Keep the original 1017 Engram shards beside the EXL3 shards; packing indexes the weights without copying them.
 

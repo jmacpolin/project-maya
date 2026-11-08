@@ -36,6 +36,9 @@ TIERS = (("ram_fetch", "From RAM", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN
 # memory's (Engram) read time - each a token
 TIERS_DS4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("disk_mb", "Disk reads", WARN, " MB/tok"),
              ("promo", "Promoted", ACCENT, "/tok"), ("engram_ms", "N-gram memory", ACCENT, " ms/tok"))
+# MiniMax's (maya-mm3): GLM's keys, but the experts VRAM does not hold are computed on the CPU from pinned RAM
+TIERS_MM3 = (("ram_fetch", "On the CPU", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN, "/tok"),
+             ("promo", "Promoted", ACCENT, "/tok"))
 TIPS = {   # the Monitor's advice under the tiers, said shorter as the box narrows (one line: the longest that fits)
     "disk": ("Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context "
              "makes answers faster.", "Many experts come from the SSD: more RAM or a shorter context is faster.",
@@ -64,6 +67,11 @@ def num(n):
 def fmt(n, d: int = 0) -> str:
     n = num(n)
     return "–" if n is None else f"{n:,.{d}f}"
+
+
+def rate_text(mb) -> str:
+    """A transfer rate in MB/s (GB/s from 1000): the dashboard's one spelling of it."""
+    return "–" if mb is None else f"{mb / 1024:.1f} GB/s" if mb >= 1000 else f"{mb:,.{1 if mb < 10 else 0}f} MB/s"
 
 
 def kfmt(n) -> str:
@@ -120,6 +128,19 @@ def clip(s: str, width: int) -> str:
 def label(k: str, v, unit: str = "", width: int = 0) -> Text:
     return Text.assemble((f"{k}  ".ljust(width), MUTED), (v if isinstance(v, str) else fmt(v), f"bold {INK}"),
                          (unit if unit == "%" else f" {unit}" if unit else "", MUTED))
+
+
+def shape(content):
+    """What decides a box's height, without drawing it: the lines of a text, the rows of a table, the parts of a group
+    (None: not known - the box is laid out)."""
+    if isinstance(content, Text):
+        return content.plain.count("\n")
+    if isinstance(content, Table):
+        return ("table", content.row_count)
+    if isinstance(content, Group):
+        parts = tuple(shape(r) for r in content.renderables)
+        return None if None in parts else parts
+    return None
 
 
 def speed(m: dict, width: int):
@@ -197,12 +218,16 @@ def tiers(m: dict, width: int):
     for color, what, k, extra in parts:
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
-    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS:
+    mm3 = eng.get("engine_kind") in ("mm3", "qwen")   # (CYBER-FROST's Qwen path too: the CPU computes the others)
+    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
         rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), (unit, MUTED)),
                      spark(h.get(key), max(8, width - 32), color=color))
     stale = time.time() - (n.get("time") or 0) > 30
     if ds4:
         tips = () if stale else TIPS["ds4_disk"] if (n.get("disk_mb") or 0) >= 500 else \
+            TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
+    elif mm3:
+        tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
             TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
     else:
         tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
@@ -228,6 +253,8 @@ def gpus(m: dict) -> Table:
                                if hw.get("gpu_mem_total") else [])   # (one card: the server sends its gpu_* only)
     names = (st.get("gpu_name") or "").split(" + ")
     t = Table(box=None, expand=True, padding=(0, 1), header_style=f"bold {MUTED}", pad_edge=False)
+    # (PCIe, power and VRAM cells are padded to one width: an idle link's burst - "204,789 MB/s" for a second - or a
+    # third digit must not push the columns beside them back and forth - #793)
     for col, right in (("GPU", False), ("Load", False), ("VRAM", True), ("Power", True), ("Temp", True),
                        ("PCIe", True)):
         t.add_column(col, justify="right" if right else "left", no_wrap=True)
@@ -239,12 +266,12 @@ def gpus(m: dict) -> Table:
         rx = g.get("pcie_rx_mb")
         t.add_row(Text.assemble((f"{g.get('index')} ", f"bold {INK}"), (name, MUTED)),
                   Text.assemble(bar((util or 0) / 100, 10), (f" {fmt(util):>3}%", INK)),
-                  Text.assemble((gb(g.get("mem_used")), INK), (f" / {gb(g.get('mem_total'), 0)} GB", MUTED)),
-                  Text.assemble((fmt(g.get("power")), INK), (f" / {fmt(g.get('power_limit'))} W", MUTED)),
-                  Text(f"{fmt(temp)} °C", DANGER if (temp or 0) >= 87 else WARN if (temp or 0) >= 80 else INK),
+                  Text.assemble((gb(g.get("mem_used")).rjust(4), INK), (f" / {gb(g.get('mem_total'), 0)} GB", MUTED)),
+                  Text.assemble((fmt(g.get("power")).rjust(3), INK), (f" / {fmt(g.get('power_limit')).rjust(3)} W", MUTED)),
+                  Text(f"{fmt(temp).rjust(2)} °C", DANGER if (temp or 0) >= 87 else WARN if (temp or 0) >= 80 else INK),
                   Text.assemble((f"Gen{gen}" if gen else "–", INK),
                                 (f" x{g.get('pcie_width')}" if g.get("pcie_width") else "", MUTED),
-                                (f" · {fmt(rx, 1 if rx < 10 else 0)} MB/s" if rx is not None else "", MUTED)))
+                                (f" · {rate_text(rx).rjust(10)}" if rx is not None else "", MUTED)))
     if not cards:
         t.add_row(Text("no GPU readings (nvidia-smi / NVML did not answer)", MUTED), "", "", "", "", "")
     return t
@@ -255,8 +282,7 @@ def hardware(m: dict, width: int) -> Table:
     disk - each with its last minute."""
     hw, st, h, eng = (m.get(k) or {} for k in ("hardware", "hardware_static", "history", "engine"))
 
-    def rate(mb):
-        return "–" if mb is None else f"{mb / 1024:.1f} GB/s" if mb >= 1000 else f"{mb:,.{1 if mb < 10 else 0}f} MB/s"
+    rate = rate_text
     n = len(hw.get("gpus") or [])
     tiles = [("GPU load", fmt(hw.get("gpu_util")), "%", f"mean of {n} cards" if n > 1 else "", h.get("gpu_util"), 100),
              ("VRAM", gb(hw.get("gpu_mem_used")), f"/ {gb(hw.get('gpu_mem_total'), 0)} GB",
@@ -407,6 +433,8 @@ class Dashboard(VerticalScroll):
 
     def on_mount(self) -> None:
         self.metrics, self.fails, self.drawn, self.load = None, 0, None, LoadWatch(None, [])
+        self.noted = None                               # the banner's notes as drawn
+        self.shapes, self.puts = {}, {}                 # each box's shape as drawn (put), and how often it was drawn
         for box, name in (("load", "Loading the model"), ("speed", "Throughput"), ("tiers", "Where the experts live"),
                           ("gpus", "GPUs"), ("hw", "Hardware"), ("reqs", "Recent requests")):
             self.query_one(f"#dash-{box}").border_title = title(name)
@@ -449,6 +477,7 @@ class Dashboard(VerticalScroll):
         try:
             self.fill(m)
         except Exception as e:                         # noqa: BLE001 - numbers it cannot show never stop the screen
+            self.noted = None
             self.query_one("#dash-banner", Static).update(Text(f"! the dashboard could not show these numbers ({e})",
                                                                DANGER))
             self.query_one("#dash-banner").display = True
@@ -457,14 +486,29 @@ class Dashboard(VerticalScroll):
         half = (self.size.width - 1) // (1 if self.screen.has_class("narrow") else 2) - 4
         full = self.size.width - 5
         note = banners(m, self.fails)
-        self.query_one("#dash-banner", Static).update(note)
-        self.query_one("#dash-banner").display = bool(note.plain)
-        self.query_one("#dash-speed", Static).update(speed(m, half))
-        self.query_one("#dash-tiers", Static).update(tiers(m, half))
+        if note != self.noted:                          # (the same notes, or none, every second: nothing to lay out)
+            self.noted = note
+            self.query_one("#dash-banner", Static).update(note)
+            self.query_one("#dash-banner").display = bool(note.plain)
+        self.put("#dash-speed", speed(m, half))
+        self.put("#dash-tiers", tiers(m, half))
         self.query_one("#dash-tiers").border_subtitle = tiers_sub(m)
         gpu_count = len((m.get("hardware") or {}).get("gpus") or [])
         self.query_one("#dash-gpus").border_subtitle = Text(f"{gpu_count} cards" if gpu_count > 1 else "",
                                                             f"italic {FAINT}")
-        self.query_one("#dash-gpus", Static).update(gpus(m))
-        self.query_one("#dash-hw", Static).update(hardware(m, full))
-        self.query_one("#dash-reqs", Static).update(requests(m, full))
+        self.put("#dash-gpus", gpus(m))
+        self.put("#dash-hw", hardware(m, full))
+        self.put("#dash-reqs", requests(m, full))
+
+    def put(self, box: str, content) -> None:
+        """A box's new numbers.  The screen is laid out again only when the box's shape changed (the lines of its text,
+        the rows of its table, its width): a new reading of the same boxes - once a second, all day - only draws them,
+        and the layout of the whole screen was most of an idle dashboard's CPU.  Every tenth reading is laid out all
+        the same, so a line that wrapped differently never stays wrong for long."""
+        w = self.query_one(box, Static)
+        key = (shape(content), w.content_size.width)
+        n = self.puts.get(box, 0) + 1
+        self.puts[box] = n
+        same = key[0] is not None and self.shapes.get(box) == key and n % 10 != 0
+        self.shapes[box] = key
+        w.update(content, layout=not same)

@@ -1,15 +1,25 @@
-# Experimental Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
+# Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
 engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
-layers (see [Two GPUs](#two-gpus)), and serves text. Images are not enabled by this installer;
-Linux users can opt into the existing [CPU image encoder](#cpu-image-encoder-on-linux).
+layers (see [Two GPUs](#two-gpus)), and reads pictures too: setup builds the image encoder for the GPU
+(ggml's HIP backend), started only while a picture is encoded, as on NVIDIA; `--no-vision` leaves it out. The
+[CPU image encoder](#cpu-image-encoder-on-linux) stays an option on Linux (`--vision-cpu`).
 Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
 3.10+, CMake 3.24+, and a C++20 compiler. `ROCM_PATH` selects an installation
-outside `/opt/rocm`. Everything Maya downloads goes into the project or its
-model-data folder; setup does not install system packages.
+outside `/opt/rocm`. Versioned LLVM slots, as Gentoo's
+`<root>/lib/llvm/22/bin/clang++`, are accepted too. Everything Maya downloads
+goes into the project or its model-data folder; setup does not install system
+packages.
+
+A distribution's own ROCm packages under `/usr` work too, including Debian's and Ubuntu's multiarch layout
+(`/usr/lib/x86_64-linux-gnu/libhipblas.so`, the compiler in `/usr/lib/llvm-<N>/bin`, the device bitcode in
+`/usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode`). A ROCm older than 7 (Debian's 6.4, hipBLAS 2.x) is untested and
+refused by default; `MAYA_HIP_ALLOW_ROCM6=1` lets setup go on with a warning. The build then turns on hipBLAS 2's
+`HIPBLAS_V2` API and skips `hipblasSetWorkspace` (absent before hipBLAS 3). Measured that way on Debian sid
+(ROCm 6.4.3, hipBLAS 2.4) with an MI50 + MI100 layer split and a CPU without AVX2 - see the pull request.
 
 ```sh
 ./maya.sh --backend hip --gpu 0 --check
@@ -52,10 +62,15 @@ amount.
 
 ## CPU image encoder on Linux
 
-HIP setup skips the image encoder, but the server can use the existing CPU-only
-`maya-vision` helper alongside the HIP text engine. This is an explicit manual
-setup; it does not enable an AMD GPU vision backend or change the installer's
-text-only default. Stop Maya before building or changing the config.
+HIP setup builds a GPU image encoder (above); instead, the server can use a CPU-only
+`maya-vision` helper alongside the HIP text engine: for a card the GPU encoder does not
+run on. `--setup --vision-cpu` does all of the below - it builds the encoder into
+`build-vision-cpu/` (ggml's CPU backend, no GPU toolkit; a few minutes), fetches the
+vision files and writes the `vision` member with `"gpu": false`; the server keeps that
+encoder running beside the model (about 1.1 GB of RAM, 4 CPU threads by default -
+`"threads"` in the member sets another count). Give it at every setup: one without it
+writes the GPU encoder's member again. `--build-only --vision-cpu` builds it beside the
+GPU one, for a container image. By hand, stop Maya before building or changing the config:
 
 After HIP setup has fetched its pinned `third_party/llama.cpp` checkout, run
 these commands from the Maya project root. If you used `--llama-dir`, use that
@@ -102,8 +117,8 @@ with your project path. If your model-data directory differs, use its paths:
 
 Start with `./maya.sh --config /path/to/your-hip-config.json --port 8099`.
 Check that `/health` reports `images: true`, then send an actual image through
-`/v1/chat/completions`. Keep the manually edited config if running setup again;
-the HIP installer still writes a text-only config.
+`/v1/chat/completions`. A setup run again writes its own `vision` member: give it
+`--vision-cpu`, or edit the config again.
 
 Verified on Linux, Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`), 128 GB unified
 RAM, ROCm 7.14.1, stock Maya v1.1.5 (`5403c222`), Maya-S24, and pinned llama.cpp
@@ -118,7 +133,7 @@ Windows, large-image limits, and multiple-image workloads were not tested here.
 `--gpus 0,1` splits the layers across two supported cards, as on NVIDIA: each card caches the experts of its own
 half, and the second half also runs the model's MTP block, which drafts the next token so both cards stay busy. Setup
 puts the card with more VRAM first (it takes the bigger first half), leaves the split point to the engine, and writes
-one hipBLASLt table per architecture (`MAYA_HIPBLASLT_TUNING` takes a `:`-separated list; each card uses the table
+one hipBLASLt table per architecture (`MAYA_HIPBLASLT_TUNING` takes a path list, `:`-separated on Linux and `;` on Windows; each card uses the table
 for its own architecture). A discrete GPU paired with a unified-memory APU puts the discrete GPU first and loads the
 parts sequentially (`MAYA_GLM_PARALLEL_LOAD=0`), so the APU sizes its pool after the first part pins its RAM tier.
 The two cards may be different architectures. The split passes one small host-memory hop
@@ -170,29 +185,40 @@ speed table; the CPU lane still takes the misses the helper does not own.
 Four V620s (32 GB each, passively cooled) split the layers like any four cards: `--gpus 0,1,2,3`. The setup writes
 the discrete-card defaults (3 GiB of VRAM headroom a card, a 1024-token prompt sub-batch and a 4096 MiB prompt
 budget); no hipBLASLt table exists for `gfx1030`, so the prompt's projections stay on plain hipBLAS. The split passes
-one small host-memory hop per token, so the cards need no peer-to-peer path between them. Not measured on the cards yet.
+one small host-memory hop per token; `MAYA_GLM_P2P=1` sends it GPU to GPU instead where the cards have peer access
+(four V620s behind one PCIe switch do). Not measured on the cards yet.
 
-**What is checked without the cards.** Maya at v1.1.28 compiles for `gfx1030` alone with ROCm 7.14.0 (TheRock's
-`rocm[libraries,devel,device-gfx1030]` wheels, clang 23): both engines and all 170 HIP targets of the build, the GPU
-checks of [Validation](#validation) among them; and with ROCm 7.2.0 (AMD's packages, clang 22): both engines and the
-GPU checks of [Validation](#validation). Also a static check that every kernel that needs WMMA or `sudot4`
-keeps a host-side guard RDNA 2 does not pass (the prompt attention's F32 path, the fused prompt experts on gfx1100 /
-gfx1151 only, DeepSeek's `tc_ok()`). On the cards, run the checks of [Validation](#validation) on each one first
-(`HIP_VISIBLE_DEVICES=0`, then 1, 2, 3).
+**What is checked without the cards.** Maya v1.1.56 with this branch's commits compiles its three engines (`maya`, `maya-ds4`, `maya-mm3`) for
+`gfx1030` alone with ROCm 7.2.0 (AMD's packages, clang 22, the image's ROCm), through `./maya.sh --backend hip
+--build-only --hip-archs gfx1030` on a machine without GPUs. A static check that every kernel that needs WMMA or
+`sudot4` keeps a host-side guard RDNA 2 does not pass (the prompt attention's F32 path, the fused prompt experts,
+DeepSeek's `tc_ok()`) was made at v1.1.28. On the cards, run the checks of [Validation](#validation) on each one
+first (`HIP_VISIBLE_DEVICES=0`, then 1, 2, 3).
 
-**Two sockets.** With the cards on one socket's PCIe lanes, keep Maya's threads on that socket's CPUs
-(`numactl --cpunodebind=<the cards' node>`; `cat /sys/bus/pci/devices/<card>/numa_node` says which). The engine
-reads the CPUs it is given: a split of four cards runs one CPU lane for all of them, sized from the physical cores
-of that node (by its sizing rule, on two 8-core Xeon Gold 6144s: 5 threads confined to one node, 12 unconfined; not
-measured), and its RAM tier is still spread page by page over both sockets' memory (`MAYA_GLM_NUMA=0` keeps it from
-doing that). Prefer `--preferred=<node>` to `--membind=<node>` for the memory: a strict bind caps the page cache
-(DeepSeek reads its experts in place) at one node and can end the engine when that node fills.
+**RDNA 2 settings worth measuring** (each off by default, [Settings](SETTINGS.md)): DeepSeek's prompt GEMMs in FP16
+on `gfx103x` (`MAYA_DS4_PROMPT_F16=1`) and its IQ experts' prompt on the MMQ path (`MAYA_DS4_EXPERT_MMQ=1`) - both
+change the answers slightly; GLM's split hops GPU to GPU (`MAYA_GLM_P2P=1`) and DeepSeek's tensor-parallel pair's
+prompt all-reduce GPU to GPU (`MAYA_DS4_HIP_PEER_AR=auto`) - the same answers.
+
+**Two sockets.** With the cards on one socket's PCIe lanes there are two ways to place Maya:
+
+- **On the cards' socket** (`numactl --cpunodebind=<the cards' node> --preferred=<that node>`;
+  `cat /sys/bus/pci/devices/<card>/numa_node` says which). A split of four cards runs one CPU lane for all of them,
+  sized from the physical cores it is given (by its sizing rule, on two 8-core Xeon Gold 6144s: 5 threads on one
+  node), and its RAM tier is still spread page by page over both sockets' memory (`MAYA_GLM_NUMA=0` keeps it from
+  doing that). Prefer `--preferred` to `--membind`: a strict bind caps the page cache (DeepSeek reads its experts in
+  place) at one node and can end the engine when that node fills.
+- **On both sockets, GLM's RAM tier in halves** (`MAYA_GLM_ROW_HALVES=1`, no CPU binding): the low half of each
+  RAM-held expert's rows on one node and the high half on the other, and each CPU-lane thread takes its own node's
+  rows first, so no expert byte crosses the socket link; the answers are the same bit for bit. The lane gets 12
+  threads there (the same rule, both sockets' cores). Not measured on these cards.
 
 **Passive cooling.** Server cards in a workstation reach their junction limit long before anything slows them down:
 `--env MAYA_THERMAL_ABORT_C=90` stops serving at 90 °C on any card's edge, junction or memory sensor, with exit
 status 90 ([Settings](SETTINGS.md)).
 
-**In a container.** The image builds both engines without the cards and keeps the configs outside itself:
+**In a container.** The image builds every engine and GLM-5.3-Flash's image encoder without the cards, and keeps the
+configs outside itself:
 
 ```sh
 ./maya.sh --backend hip --build-only --hip-archs gfx1030 --yes      # in the image's build: no GPU needed
@@ -241,6 +267,23 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 3K- and 8K-token prompts, against 18.4-19.7 without it; 3K- and 8K-token prompts read at 271 and 278 tokens/s
 (the fused prompt experts and the `wmma2` attention, both on by default on `gfx1151`).
 
+## Instinct MI300X / MI325X
+
+AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64
+card and runs through the hip_compat half-wavefront layer.
+
+Install ROCm's development packages for the card first (ROCm 7.14: `amdrocm-core-dev7.14-gfx942` and
+`amdrocm-blas-dev7.14`), then run the setup above without the `MAYA_GLM_RAM_GB` override. On an MI325X (256 GB) every
+expert of Maya-L fits in HBM next to a 1M-token context; with that much room, `"--kv-streaming", "off"` in the config's
+`"args"` keeps the whole latent cache on the card too.
+
+```sh
+./maya.sh --backend hip --gpu 0 --context 1048576 --no-vision --yes --model Maya-L --download-model
+```
+
+`./maya.sh --bench` on one MI325X (v1.1.27, Maya-L, 1M context, `--kv-streaming off`): answers at 84.0 tokens/s,
+prompts at 1307 tokens/s (2K tokens) and 1663 tokens/s (8K tokens). Not tried yet: the MI300X itself, more than one GPU.
+
 ## Windows
 
 `START-MAYA.bat --backend hip` sets Maya up natively on Windows 10/11 for the same GPUs, Strix Halo and Gorgon Halo
@@ -259,7 +302,7 @@ pack and the dashboard are the same as on an NVIDIA PC.
 
    ```bat
    START-MAYA.bat --backend hip --gpu 0 --check
-   START-MAYA.bat --backend hip --gpu 0 --setup --model Maya-L
+   START-MAYA.bat --backend hip --gpu 0 --setup --model glm-maya-l
    ```
 
 The setup takes the ROCm it finds first: `ROCM_PATH`, TheRock's `rocm-sdk` (`ROCM_VENV`, Maya's `.venv` or PATH), AMD's
@@ -317,7 +360,14 @@ sub-batches. Two settings matter on AMD:
   `tools/hip/tune_hipblaslt` (`tools/hip/<arch>-glm-hipblaslt-<version>.txt`).
   Setup writes it when a table for the card exists. The engine accepts a table
   only for its own architecture and hipBLASLt version; otherwise, and for shapes
-  without a row, it keeps plain hipBLAS. The tuner's absolute-error gate now
+  without a row, it keeps plain hipBLAS. Builds of one hipBLASLt version can
+  number their solutions differently, so a version may have more than one table
+  (`<version>.txt`, `<version>-b.txt`): the engine keeps every matching table
+  and takes, per shape, the first whose solution its hipBLASLt accepts. The tuner's default shapes are
+  DeepSeek's, so a table generated from them covers none of another model's
+  projections: pass `--preset glm` for GLM-5.3-Flash (or `--shape T,N,K`) and
+  check the engine's log, which now prints one line per shape that misses the
+  table. On a 8060S, four GLM rows took a prompt from 128 to 168 tok/s. The tuner's absolute-error gate now
   scales with `sqrt(K / 4096)`, so long-K projections are no longer rejected.
 
 Measured prompt speed, GLM-5.3-Flash Maya-S-v2 IQ2_XXS, ROCm 7.2:
@@ -359,8 +409,7 @@ so Strata's model benchmarks do not establish Maya performance.
 
 ## Validation
 
-Test host: RX 7900 XT 20 GiB, Ryzen 7 9800X3D, 192 GB installed DDR5, native
-Ubuntu Linux, system ROCm 7.2.1 / Clang 22, plus AI PRO R9700 32 GiB. Maya base v1.0.10 (`e4bd57e`).
+Test host: RX 7900 XT 20 GiB, Ryzen 7 9800X3D, 192 GB installed DDR5, native Ubuntu Linux, system ROCm 7.2.1 / Clang 22, plus AI PRO R9700 32 GiB. Maya base v1.0.10 (`e4bd57e`).
 
 The HIP engine and selected test targets build. All 14 selected GPU checks
 pass: device allocation, expert upload staging, packed-byte/shuffle
@@ -408,3 +457,8 @@ seven smoke requests (arithmetic, code, a two-turn conversation, three
 prompts at 307-385 tok/s on 1.8-2.5K-token prompts and the hipBLASLt table
 loaded. The R9700 runs the full model with every expert in VRAM or a pinned
 RAM tier; the prompt speeds above were measured there.
+
+
+### Confirmed working 
+-  Test host: RX 7900 XT 20 GiB, Ryzen 9 7900X, 96 GB installed DDR5, decokerized Ubuntu Linux, system ROCm 7.2.4, Maya base v1.1.46 (`3589d6f`). 
+- Model : Maya-S24, 1M context

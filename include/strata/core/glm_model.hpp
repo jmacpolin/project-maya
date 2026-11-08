@@ -134,6 +134,7 @@ public:
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
+        double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
     };
     FastStats fast_stats() const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
@@ -168,7 +169,8 @@ public:
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the
     /// CPU).  pcie_share(): the split in use, as a share; set_pcie_share(s): this split from the next token on, s < 0
     /// the one the engine started with (STRATA_GLM_PCIE_SHARE, else measured at start).  cpu_lane_threads(): the
-    /// threads taking its jobs; set_cpu_lane_threads(n): at most n of the pool's, n <= 0 all of them.  Both are for
+    /// threads taking its jobs; cpu_lane_threads_max(): the pool's size (STRATA_GLM_CPU_LANE_MAX can make it more than
+    /// the lane's own count); set_cpu_lane_threads(n): at most n of the pool's, n <= 0 the lane's own.  These are for
     /// setup's calibration (per request, no restart); false when this engine has no CPU lane.
     double pcie_share() const;
     /// STRATA_GLM_CPU_CAL: once a request (2000+ lane experts a window), drop a calibration decode stays >15% from
@@ -178,6 +180,7 @@ public:
     void lane_retime();
     bool set_pcie_share(double share);
     int cpu_lane_threads() const;
+    int cpu_lane_threads_max() const;
     bool set_cpu_lane_threads(int n);
     /// The decode's disk reads: each expert read from the SSD in 3 x n pieces at once (STRATA_GLM_READ_CHUNKS, 8).
     /// set_read_chunks(n): n (1-16) from the next read on, n <= 0 the engine's own - for setup's calibration (per
@@ -743,6 +746,9 @@ public:
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                     int64_t& produced, std::string& err);
+    bool decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                          int64_t& produced, std::string& err);   // the MTP drafts through a pipelined verify window
+                                                                   // over a split (STRATA_GLM_SPEC_WIN, glm_mtp.cu)
     uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
@@ -872,6 +878,15 @@ public:
                           const int* drafts, std::string& err);
     bool mtpw_draft_take(int32_t* out, std::string& err);   // the drafts, conversation after conversation
     uint64_t mtpw_steps_ = 0, mtpw_rows_ = 0;              // (statistics: verify steps and rows, every group)
+    // STRATA_GLM_MTPW_CREWS=1: the group's rows enqueued by the parts' own workers (the host's serial launch chain,
+    // which a row-4 group's round otherwise spends ~80-100 ms on, runs on all the parts at once).  The workers keep
+    // the same per-part body (mtpw_part), gated per row by the previous part's row-hop events; the host only hands the
+    // group to them (mtpw_front/mtpw_back turn into kicks) and waits for the enqueues at the picks.
+    void rows_crew_destroy();                              // (called with mtpw_destroy)
+    void rows_crew_kick(void* job, int k);                 // hand a job to a part's worker's queue
+    bool rows_crew_wait(void* job, int k, std::string& err);   // part k's enqueue of a job done (the host's picks precede)
+    void rows_crew_start(std::string& err);                // one worker a part, before the first kicked group
+    void* rows_crew_ = nullptr;                            // RowsCrew (the crew here, in glm_mtp_rows.cu)
 private:
     struct RowSeq;
     bool rows_bind_win(const int* seqs, const int* counts, int n, RowSeq* rw, std::string& err);
@@ -983,7 +998,9 @@ public:
     bool prefill_bind(uint8_t* region, size_t bytes, std::string& err);   // its buffers inside the borrowed region
     // ... laid out for chunks of T (the bytes it uses); end: the prompt's last position + 1, which the KV streaming stage
     // must hold (-1: the whole context)
-    size_t prefill_carve(int T, int64_t end = -1);
+    /// The prompt path's device buffers for a chunk of T tokens, laid out in the lendable region.  False when the
+    /// layout does not fit it: the prompt is then read in smaller chunks (nothing has been computed yet).
+    bool prefill_carve(int T, int64_t end = -1);
     bool prefill_lend(std::string& err);                    // the tail slots -> the prompt path (drops their experts)
     bool prefill_return(std::string& err);                  // ... and back to the expert pool
     void prefill_destroy();

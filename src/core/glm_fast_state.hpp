@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -49,6 +50,32 @@ inline bool wait_event(cudaEvent_t ev, const char* what, std::string& err) {
 }
 
 namespace gf = strata::kernels::glmf;
+
+// #860: a draft id the host reads back (the NextN block's pick) that is no token id: the confirmed token in its place -
+// a wrong draft the verify rejects like any other, so the answer is unchanged - said once a process.  A real id passes
+// through untouched (nothing on the device, no sync).
+inline int32_t draft_id(int32_t d, int32_t fallback, int64_t n_vocab, const char* who) {
+    if (d >= 0 && (int64_t) d < n_vocab) return d;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "%s: a draft is no token id (%d: its logits are not finite?) - drafting on with the confirmed "
+                             "token in its place (said once)\n", who, (int) d);
+    return fallback;
+}
+// ... and at a drafting decode's end, its devices idle (a synchronous read - never per token): the argmax picks on
+// device `dev` that found no finite logit (gf::argmax_nonfinite: they took token 0), said once a process
+inline void argmax_nonfinite_note(int dev, const char* who) {
+    static std::atomic<bool> said{false};
+    if (said.load(std::memory_order_relaxed)) return;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(dev);
+    const unsigned n = gf::argmax_nonfinite();
+    cudaSetDevice(cur);
+    if (n > 0 && !said.exchange(true))
+        std::fprintf(stderr, "%s: CUDA%d %u argmax pick(s) found no finite logit and took token 0 instead - the model's "
+                             "state holds non-finite values (said once)\n", who, dev, n);
+}
 
 inline void cpu_relax() {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -127,11 +154,14 @@ class Workers {
 public:
     // spin_us: how long an idle worker spins for the next batch before it sleeps; cpus: the CPUs the workers run on
     // (empty: any)
-    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false)
+    // (one_to_one: worker i on cpus[i] alone, the rest on all of them)
+    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false,
+                     bool one_to_one = false)
         : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
         for (int i = 0; i < n; ++i) {
             th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
-            pin_thread(th_.back().native_handle(), cpus);
+            pin_thread(th_.back().native_handle(),
+                       one_to_one && i < (int) cpus.size() ? std::vector<int>{cpus[(size_t) i]} : cpus);
         }
     }
     ~Workers() {
@@ -140,6 +170,7 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
         }
         cv_.notify_all();
+        idle_cv_.notify_all();
         for (auto& t : th_) t.join();
     }
     void run(int n, const std::function<void(int)>& fn) {
@@ -170,8 +201,13 @@ public:
     }
     int size() const { return (int) th_.size() + 1; }
     // only the caller and the first n - 1 workers take jobs (fewer threads without a restart: setup's calibration);
-    // a batch's job count should be active() for one job a thread
-    void set_active(int n) { active_.store(std::max(1, std::min(n, size())), std::memory_order_release); }
+    // a batch's job count should be active() for one job a thread.  The workers left out wait on idle_cv_, which only
+    // this wakes (under mu_, so none misses it)
+    void set_active(int n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        active_.store(std::max(1, std::min(n, size())), std::memory_order_release);
+        idle_cv_.notify_all();
+    }
     int active() const { return active_.load(std::memory_order_acquire); }
     // the priority of this thread's batches on a concurrent pool (higher first; default 0)
     static void set_thread_prio(int p) { tl_prio() = p; }
@@ -195,17 +231,26 @@ private:
     void loop(int id) {
         uint64_t seen = gen_.load();
         for (;;) {
-            const auto t0 = std::chrono::steady_clock::now();
-            int spins = 0;
             // a worker set_active left out sleeps at once: spinning, it held a CPU the active ones and the disk
             // readers wanted, so the setup's calibration timed fewer threads on a CPU still full of spinners
-            // (24-core Ultra 9 275HX, no SMT, Windows: a decode's disk wait 16.8 ms with 24 threads, 8.1 ms with 16)
-            const bool idle = id + 1 >= active_.load(std::memory_order_acquire);
+            // (24-core Ultra 9 275HX, no SMT, Windows: a decode's disk wait 16.8 ms with 24 threads, 8.1 ms with 16).
+            // It sleeps on idle_cv_ until set_active takes it in, outside sleeping_: on cv_, every batch's notify_all
+            // woke it to sleep again, and the pool's sleepers made run() notify at all - the fewer threads active, the
+            // more of them, so a calibration measured the lower counts slower than they run (#178)
+            if (id + 1 >= active_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mu_);
+                idle_cv_.wait(lk, [&] { return quit_.load() || id + 1 < active_.load(std::memory_order_acquire); });
+                if (quit_.load()) return;
+                seen = gen_.load(std::memory_order_acquire);   // (a batch already running goes on without it)
+                continue;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            int spins = 0;
             while (gen_.load(std::memory_order_acquire) == seen) {
                 if (quit_.load(std::memory_order_relaxed)) return;
                 cpu_relax();
-                if (idle || ((++spins & 255) == 0 &&
-                             std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_))) {
+                if ((++spins & 255) == 0 &&
+                    std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_)) {
                     std::unique_lock<std::mutex> lk(mu_);
                     sleeping_.fetch_add(1);
                     cv_.wait(lk, [&] { return quit_.load() || gen_.load() != seen; });
@@ -311,7 +356,7 @@ private:
     int spin_us_;
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
-    std::condition_variable cv_;
+    std::condition_variable cv_, idle_cv_;
     const std::function<void(int)>* volatile fn_ = nullptr;
     std::atomic<int> total_{0}, done_{0}, sleeping_{0}, active_;
     std::atomic<uint64_t> ticket_{0}, gen_{0};
@@ -363,13 +408,20 @@ int trunk_skip_from(int il);
 namespace gf = strata::kernels::glmf;
 
 struct Glm5Model::FastState {
-    bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
+    bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
-    int* pf_n_buf[2] = {nullptr, nullptr};
+    int* pf_n_buf[2] = {nullptr, nullptr};   // (+ word 4: STRATA_GLM_PF_CE's need - the route's seq, 0: no copies)
+    // STRATA_GLM_PF_CE=1: the prefetch's copies on a copy engine, issued by the service thread (no SMs held); the next
+    // layer waits for pf_flag_d (written after the copies on the same stream) to reach its need
+    bool pf_ce = false;
+    cudaStream_t pfce_stream = nullptr;
+    unsigned int* pf_flag_d = nullptr;
+    unsigned int* pfce_seq_h = nullptr;   // [kRingSize] pinned: the value each route's flag copy writes
+    std::atomic<uint64_t> pfce_copies{0}, pfce_lost{0};
     void* arena = nullptr;
     size_t arena_bytes = 0;
     size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
@@ -621,6 +673,7 @@ struct Glm5Model::FastState {
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
+    size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares
     struct Drain {
         int il, vslot, key, rclass, rslot;
@@ -673,6 +726,14 @@ struct Glm5Model::FastState {
     std::atomic<bool> helper_failed{false};
     std::string helper_error;
     std::atomic<uint64_t> helper_experts{0}, helper_routes{0}, helper_us{0};
+    // STRATA_GLM_HELPER_OVERLAP=1: a route's helper call runs beside its CPU-lane experts (enqueue, the CPU lane, wait)
+    // instead of before them.  The routes that had both, their CPU-lane time (beside the helper), the time then spent
+    // waiting for the helper, and with STRATA_GLM_PROF the time saved (each route's min(CPU lane, helper GPU time))
+    bool helper_overlap = false;
+    std::atomic<uint64_t> helper_ovl_routes{0}, helper_ovl_cpu_us{0}, helper_ovl_wait_us{0}, helper_ovl_saved_us{0};
+    // the lane's own thread count when cpu_pool holds more (STRATA_GLM_CPU_LANE_MAX): a request that names no
+    // cpu_threads returns to it, not to the whole pool; 0 = the pool's size
+    int cpu_threads0 = 0;
     // one GPU with a DFlash drafter, on a host of two NUMA nodes or more (STRATA_GLM_WIN_LANES, on): a batched verify
     // window's tokens' CPU-lane experts go to two lane threads, token t to lane t % 2 - lane 0 drives cpu_pool (then
     // pinned to the GPU's node), lane 1 a pool of its own on another node - so the window's tokens run on both

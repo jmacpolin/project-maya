@@ -70,8 +70,9 @@ GLM5NEXT_BF16 = (
     "indexer.attn_q_b.weight", "indexer.attn_k.weight", "indexer_compressor_gate.weight",
     "indexer_compressor_ape.weight", "indexer.proj.weight", "indexer.k_norm.weight",
     "indexer.k_norm.bias",
-    # the router and its noaux_tc selection bias (F32 by config: moe_router_dtype float32)
-    "ffn_gate_inp.weight", "exp_probs_b.bias",
+    # the router (F32 by config: moe_router_dtype float32).  Its noaux_tc selection bias, exp_probs_b.bias, is NOT
+    # here: it stays F32 as stored (#861: BF16 left 6-11 distinct values of 288 in a layer)
+    "ffn_gate_inp.weight",
     # the KDA gates and norms (gates stay unquantized in the released model); the conv weights
     # seed the whole KDA recurrence, so their quantization noise would accumulate per token
     "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_beta.weight",
@@ -242,6 +243,21 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                         return 1
                     raw = (u >> 16).astype(np.uint16).tobytes()     # the exact BF16 values
                     kind = "4"
+                if arch == "qwen4exp" and t.type_name == "BF16" and t.name.endswith("ple_conv1d.weight"):
+                    # the engine's PLE conv reads F16 (ple.cu conv1d_f16); unsloth's GGUFs store it as BF16.  BF16's
+                    # 8-bit mantissa fits F16's 11 bits, so normal values carry over exactly; only the ones below F16's
+                    # normal range (|w| < 2^-14, F16 subnormals: unsloth's file has ~100 of 40960, all < 1e-5) round,
+                    # as llama.cpp's own F16 conversion rounds them.  Anything else is refused.
+                    f = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+                    h = f.astype(np.float16)
+                    off = h.astype(np.float32) != f
+                    if np.any(off & (np.abs(f) >= 2.0 ** -14)) or not np.isfinite(h).all():
+                        print("%s: BF16 values that F16 cannot hold; the engine's PLE conv is F16" % t.name)
+                        return 1
+                    raw = h.tobytes()
+                    kind = "5"
+                    converted.append({"name": t.name, "source_type": "BF16", "bytes": len(raw),
+                                      "to": "F16", "rounded_subnormals": int(off.sum())})
                 rows.append([t.name, "0", kind, str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
                              "0", "0", "1"] + ["0"] * 7)
                 fo.write(raw)
@@ -258,8 +274,9 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     if dropped:
         # (#327: "the runner skips MTP" read as drafting off - it is not: the engine reads the block from the model's
         #  files itself)
-        print("NextN/MTP: %d tensors of blk.%d+ left out of the pack - the engine reads the MTP draft block from the "
-              "model's files itself" % (dropped, block_count))
+        print("NextN/MTP: %d tensors of blk.%d+ left out of the pack - %s" % (
+            dropped, block_count, "the MTP drafter is built from them by tools/mtp_from_gguf.py" if arch == "qwen4exp"
+            else "the engine reads the MTP draft block from the model's files itself"))
     write_index(out, rows, src, served, 0)
     if compat_bf16:
         (out / "compat-bf16.json").write_text(json.dumps({
@@ -368,7 +385,10 @@ def main() -> int:
               "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next"):
+    # (a Qwen GGUF with its MTP block - qwen4exp, nextn_predict_layers 1, block_count 49 - the same: the trunk only)
+    if arch not in ("glm5-next", "glm5next"):
+        prefix = arch + "."
+    if arch in ("glm5-next", "glm5next") or int(g.metadata.get(prefix + "nextn_predict_layers", 0) or 0) > 0:
         bc = g.metadata.get(prefix + "block_count")
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
