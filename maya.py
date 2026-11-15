@@ -553,7 +553,11 @@ MODELS_BY_HAND = ("EXL3-sc_4.10bpw",)
 # when an entry names none: UD-IQ2_M's), "dense_gb": the dense weights the GPUs hold (G53.DENSE_GB likewise) - Maya-XS:
 # its weights (169.98 GB by the GGUF's header) and UD-IQ2_M's headroom (the same model's cache and working memory), the
 # dense part as measured on an AMD APU (16.98 GB; its header's non-expert tensors, 18.4 GB, less what UD-IQ2_M's
-# measurement leaves out of its own 15.7)
+# measurement leaves out of its own 15.7).  Then unsloth's UD-Q4_K_XL (jmacpolin/project-maya, 2026-11-15: a 4-bit
+# quant for a PC whose VRAM and RAM hold ~474 GB - four Radeon PRO V620s and 384 GiB of RAM) at the same revision as
+# UD-IQ2_M, by the same rules: its headers' 467.28 GB of weights plus UD-IQ2_M's headroom (6.4 GB), and its non-expert
+# tensors (21.04 GB by its headers) less the 1.4 GB UD-IQ2_M's measurement leaves out of its own; every tensor's type
+# is one tools/strata/glm_dsa_pack.py serves (the routed experts Q4_K / Q5_K / Q6_K), checked from the headers
 G53_MODELS = {
     "GLM-5.3-Maya-XS": {
         "about": "Maya-XS, Project Maya's own GLM-5.3 quant (744B, 40B active a token; the routed experts in ~1.6 "
@@ -588,6 +592,35 @@ G53_MODELS = {
             "GLM-5.3-UD-IQ2_M-00004-of-00006.gguf": "10c735d4af5d923adff14edb9bfbef63e5dce6187720c5db08a45f630638eccb",
             "GLM-5.3-UD-IQ2_M-00005-of-00006.gguf": "69ee92423d65605f3b7b07744492d42fd85c0fd898127cb23a44f213823f4cff",
             "GLM-5.3-UD-IQ2_M-00006-of-00006.gguf": "b8f96f7183eba431e047c52adab9091b3e465819c83c8c42ed94697b63507708"}},
+    "GLM-5.3-UD-Q4_K_XL": {
+        "about": "Z.ai's GLM-5.3 (744B, 40B active a token) in unsloth's UD-Q4_K_XL GGUF (its dynamic 4-bit quant: the "
+                 "routed experts Q4_K / Q5_K / Q6_K), text only, drafting with its own NextN block",
+        "repo": "unsloth/GLM-5.3-GGUF", "revision": "346b3591c7f28d1a23716f97a065ecf12ec14771", "folder": "UD-Q4_K_XL",
+        "file": "GLM-5.3-UD-Q4_K_XL-{i:05d}-of-{n:05d}.gguf", "shards": 11, "download_gb": 467.3,
+        "memory_gb": 474, "dense_gb": 19.6,
+        "bytes": {"GLM-5.3-UD-Q4_K_XL-00001-of-00011.gguf": 9428677,
+                  "GLM-5.3-UD-Q4_K_XL-00002-of-00011.gguf": 49433942336,
+                  "GLM-5.3-UD-Q4_K_XL-00003-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00004-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00005-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00006-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00007-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00008-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00009-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00010-of-00011.gguf": 48566415136,
+                  "GLM-5.3-UD-Q4_K_XL-00011-of-00011.gguf": 29314424736},
+        "sha256": {
+            "GLM-5.3-UD-Q4_K_XL-00001-of-00011.gguf": "02a3e367e8b5f5ee3341d556211faa2cc956c3e77ad0e298c6805323bfaeb02d",
+            "GLM-5.3-UD-Q4_K_XL-00002-of-00011.gguf": "374daff9e093b362a12ca89904fd0511df38b2a9794029e272c8639587a13402",
+            "GLM-5.3-UD-Q4_K_XL-00003-of-00011.gguf": "9a13948a0c7747e374766ab32272e8bf5ee2ac260ed581419cc980c00df1bb9c",
+            "GLM-5.3-UD-Q4_K_XL-00004-of-00011.gguf": "1fee29db6ab247f97e42cc7dd4132ce35f15f41fb42ba9110b73c25471171f9b",
+            "GLM-5.3-UD-Q4_K_XL-00005-of-00011.gguf": "7d38557e09934a3f6cf4eb7aa7ea8c04929bf2d40db8ba8494529d51be04bb4e",
+            "GLM-5.3-UD-Q4_K_XL-00006-of-00011.gguf": "3f6c47e4e32f7b1f9b844124622cc8d506facdb58e3304b9b4429b6c3af4f53d",
+            "GLM-5.3-UD-Q4_K_XL-00007-of-00011.gguf": "03114618ca505e4dbd63e0c8fb478cb54db86ff32ddd3681160589d8a958db8e",
+            "GLM-5.3-UD-Q4_K_XL-00008-of-00011.gguf": "e202e8679571572ae5ab490d021e3f0d0ada4794521464e6735e62516bedff96",
+            "GLM-5.3-UD-Q4_K_XL-00009-of-00011.gguf": "05d81908bc8ffd1e2ff6bb6a4e7a347c455ce87d7d6c473415d37f1749f0a337",
+            "GLM-5.3-UD-Q4_K_XL-00010-of-00011.gguf": "252eac782187e63ffdbf0650eb79538a53626991f7dfd06106cfbbd5eb1a0bb3",
+            "GLM-5.3-UD-Q4_K_XL-00011-of-00011.gguf": "d69bc418b2a08103d1b42340e803e1a98582d3766e4593c4a490475ac5bb811b"}},
 }
 
 

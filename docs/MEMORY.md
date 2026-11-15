@@ -25,6 +25,7 @@ adds room for the system and the default context.
 | | EXL3 4.05 bpw (turboderp) | 165 | ~173 | **192** | NVIDIA, AMD |
 | **GLM-5.3 (744B)**, text only | Maya-XS | 170 | ~176 | **192** | NVIDIA (V100 and newer), AMD |
 | | UD-IQ2_M (unsloth) | 239 | ~245 | **256** | NVIDIA (V100 and newer), AMD |
+| | UD-Q4_K_XL (unsloth; jmacpolin/project-maya) | 467 | ~474 | **512** | NVIDIA (V100 and newer), AMD |
 | **DeepSeek-V4.1-Flash** | Maya-XS | 277 ¹ | 121 | **128** | NVIDIA, AMD |
 | | Maya-S (default) | 340 ¹ | 186 | **224** | NVIDIA, AMD |
 | | UD-IQ1_M (unsloth) | 301 ¹ | 140 | **160** | NVIDIA, AMD |

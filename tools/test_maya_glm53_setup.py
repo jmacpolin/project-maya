@@ -353,6 +353,34 @@ class Download(unittest.TestCase):
         self.assertEqual(maya.Q.glm53_quant("GLM-5.3-Maya-XS"), "Maya-XS")
         self.assertEqual(maya.download_dir(Path("/m"), "GLM-5.3-Maya-XS"), Path("/m") / "GLM-5.3-Maya-XS")
 
+    def test_the_ud_q4_k_xl_entry(self):
+        """unsloth's UD-Q4_K_XL (jmacpolin/project-maya): 11 shards pinned at UD-IQ2_M's revision with their sizes and
+        sha256, its own memory figures (larger than UD-IQ2_M's: more weights, more of them dense), after the other
+        two, and never one of GLM-5.3-Flash's quants."""
+        self.assertEqual(list(maya.G53_MODELS), ["GLM-5.3-Maya-XS", "GLM-5.3-UD-IQ2_M", "GLM-5.3-UD-Q4_K_XL"])
+        m = maya.G53_MODELS["GLM-5.3-UD-Q4_K_XL"]
+        names = maya.shard_names(m)
+        self.assertEqual(names, [f"GLM-5.3-UD-Q4_K_XL-{i:05d}-of-00011.gguf" for i in range(1, 12)])
+        self.assertEqual(set(m["sha256"]), set(names))
+        self.assertEqual(set(m["bytes"]), set(names))
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", v) for v in m["sha256"].values()))
+        self.assertEqual(m["sha256"][names[0]], "02a3e367e8b5f5ee3341d556211faa2cc956c3e77ad0e298c6805323bfaeb02d")
+        self.assertEqual(m["revision"], maya.G53_MODELS["GLM-5.3-UD-IQ2_M"]["revision"])
+        self.assertEqual(sum(m["bytes"].values()), 467289116837)
+        self.assertAlmostEqual(m["download_gb"], sum(m["bytes"].values()) / 1e9, delta=0.05)
+        self.assertEqual(maya.file_url(m, names[10]),
+                         "https://huggingface.co/unsloth/GLM-5.3-GGUF/resolve/346b3591c7f28d1a23716f97a065ecf12ec14771/"
+                         "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00011-of-00011.gguf")
+        self.assertGreater(m["memory_gb"], m["download_gb"])
+        self.assertGreater(m["memory_gb"], maya.G53.MEMORY_GB)
+        self.assertGreater(m["dense_gb"], maya.G53.DENSE_GB)
+        self.assertEqual(maya.g53_figures("GLM-5.3-UD-Q4_K_XL"), (474, 19.6))
+        self.assertNotIn("GLM-5.3-UD-Q4_K_XL", maya.MODELS)
+        self.assertEqual(maya.Q.glm53_quant("GLM-5.3-UD-Q4_K_XL"), "UD-Q4_K_XL")
+        a = SimpleNamespace(model="glm-5.3-ud-q4_k_xl", mm3_quant=None)
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual(a.model, "GLM-5.3-UD-Q4_K_XL")
+
     def test_offered(self):
         self.assertIn("GLM-5.3-UD-IQ2_M", maya.glm_downloads())
         a = SimpleNamespace(model="glm-5.3-ud-iq2_m", mm3_quant=None)
@@ -389,10 +417,14 @@ class Download(unittest.TestCase):
         self.assertEqual(on[len(rows) + 1][0],
                          "GLM-5.3 (744B) · UD-IQ2_M, text only: download 238.6 GB from Hugging Face")
         self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[len(rows) + 1][2])
-        self.assertIn("GGUF files you already have", on[len(rows) + 2][0])
+        self.assertEqual(on[len(rows) + 2][0],
+                         "GLM-5.3 (744B) · UD-Q4_K_XL, text only: download 467.3 GB from Hugging Face")
+        self.assertIn("every expert stays in memory from about 474 GB of VRAM and RAM together", on[len(rows) + 2][2])
+        self.assertIn("GGUF files you already have", on[len(rows) + 3][0])
         self.assertEqual((got, default), (("download", flash[0]), 0))
         _, metal, _ = self.rows("metal")
-        self.assertFalse(any("UD-IQ2_M" in r[0] or "Maya-XS," in r[0] for r in metal))   # (not on Metal)
+        self.assertFalse(any("UD-IQ2_M" in r[0] or "UD-Q4_K_XL" in r[0] or "Maya-XS," in r[0]
+                             for r in metal))                                       # (not on Metal)
 
     def test_metal_refused_before_the_download(self):
         a = SimpleNamespace(backend="metal", model_dir=None, gguf_dir=None, model="GLM-5.3-UD-IQ2_M", yes=True)
