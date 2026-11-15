@@ -19,6 +19,7 @@ written by its chat template, so the agent's turn goes on.
 | --- | --- | ---: | --- |
 | **GLM-5.3 (744B) · Maya-XS** ([Maya's own GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF), the routed experts in ~1.6 bits) | `glm-5.3-maya-xs` | 170.0 GB | the whole model in a 192 GB memory pool: every expert stays in memory from about 176 GB of VRAM and RAM together |
 | **GLM-5.3 (744B) · UD-IQ2_M** ([unsloth's GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF), its dynamic 2-bit quant) | `GLM-5.3-UD-IQ2_M` | 238.6 GB | the biggest memory pools: every expert stays in memory from about 245 GB of VRAM and RAM together; closer to the original |
+| **GLM-5.3 (744B) · UD-Q4_K_XL** ([unsloth's GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF), its dynamic 4-bit quant; added by jmacpolin/project-maya) | `GLM-5.3-UD-Q4_K_XL` | 467.3 GB | about 474 GB of VRAM and RAM together keeps every expert in memory (estimated from its headers by UD-IQ2_M's figures, not measured) |
 
 Maya-XS is as close to the original as unsloth's UD-IQ1_S (the same mean KL divergence against the original
 model's own predictions) at 78% of its size. Each download is pinned to one revision of its repo, and the setup checks every shard's
@@ -30,6 +31,7 @@ SSD while it answers: keep the model on an NVMe SSD.
 ```sh
 ./maya.sh --setup --model glm-5.3-maya-xs           # downloads Maya-XS (170.0 GB)
 ./maya.sh --setup --model GLM-5.3-UD-IQ2_M          # downloads unsloth's UD-IQ2_M (238.6 GB)
+./maya.sh --setup --model GLM-5.3-UD-Q4_K_XL        # downloads unsloth's UD-Q4_K_XL (467.3 GB)
 ./maya.sh --setup --gguf-dir /path/to/UD-IQ2_M      # GGUF files you already have (all the shards)
 ```
 

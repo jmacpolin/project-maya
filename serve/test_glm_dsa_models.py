@@ -282,7 +282,12 @@ class Catalog(unittest.TestCase):
 
     def test_listed(self):
         on = self.ids()
-        self.assertEqual([k for k, m in on.items() if "744B" in m["name"]], ["glm-5.3-maya-xs", "glm-5.3-ud-iq2_m"])
+        self.assertEqual([k for k, m in on.items() if "744B" in m["name"]],
+                         ["glm-5.3-maya-xs", "glm-5.3-ud-iq2_m", "glm-5.3-ud-q4_k_xl"])
+        self.assertEqual(on["glm-5.3-ud-q4_k_xl"], {"id": "glm-5.3-ud-q4_k_xl", "family": "glm",
+                                                    "name": "GLM-5.3 (744B) · UD-Q4_K_XL", "group": "other",
+                                                    "by": "unsloth", "note": "text only", "installed": False,
+                                                    "size_gb": 467.3})
         self.assertEqual(on["glm-5.3-ud-iq2_m"], {"id": "glm-5.3-ud-iq2_m", "family": "glm",
                                                   "name": "GLM-5.3 (744B) · UD-IQ2_M", "group": "other",
                                                   "by": "unsloth", "note": "text only", "installed": False,
