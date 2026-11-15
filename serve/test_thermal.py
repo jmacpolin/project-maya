@@ -78,18 +78,29 @@ class Thermal(unittest.TestCase):
     def test_settings(self):
         self.assertEqual(TH.settings({}, {}), (None, None, 2.0))
         for off in ("", "0", "off", "none"):
-            self.assertIsNone(TH.settings({"STRATA_THERMAL_ABORT_C": off})[0])
+            self.assertIsNone(TH.settings({"MAYA_THERMAL_ABORT_C": off})[0])
         # the lowest limit set counts: a config cannot raise a supervisor's, nor switch it off
-        self.assertEqual(TH.settings({"STRATA_THERMAL_ABORT_C": "90"}, {"STRATA_THERMAL_ABORT_C": "95"})[0], 90)
-        self.assertEqual(TH.settings({"STRATA_THERMAL_ABORT_C": "90"}, {"STRATA_THERMAL_ABORT_C": "85"})[0], 85)
-        self.assertEqual(TH.settings({"STRATA_THERMAL_ABORT_C": "90"}, {"STRATA_THERMAL_ABORT_C": "0"})[0], 90)
-        lim, only, every = TH.settings({"STRATA_THERMAL_GPUS": "0000:6f:00.0, 72:00.0", "STRATA_THERMAL_EVERY_S": "1"},
-                                       {"STRATA_THERMAL_GPUS": "0000:64:00.0"})
+        self.assertEqual(TH.settings({"MAYA_THERMAL_ABORT_C": "90"}, {"MAYA_THERMAL_ABORT_C": "95"})[0], 90)
+        self.assertEqual(TH.settings({"MAYA_THERMAL_ABORT_C": "90"}, {"MAYA_THERMAL_ABORT_C": "85"})[0], 85)
+        self.assertEqual(TH.settings({"MAYA_THERMAL_ABORT_C": "90"}, {"MAYA_THERMAL_ABORT_C": "0"})[0], 90)
+        lim, only, every = TH.settings({"MAYA_THERMAL_GPUS": "0000:6f:00.0, 72:00.0", "MAYA_THERMAL_EVERY_S": "1"},
+                                       {"MAYA_THERMAL_GPUS": "0000:64:00.0"})
         self.assertEqual((only, every), ({"0000:6f:00", "0000:72:00"}, 1.0))
-        for bad in ({"STRATA_THERMAL_ABORT_C": "ninety"}, {"STRATA_THERMAL_ABORT_C": "200"},
-                    {"STRATA_THERMAL_GPUS": "card0"}, {"STRATA_THERMAL_EVERY_S": "0.1"}):
+        for bad in ({"MAYA_THERMAL_ABORT_C": "ninety"}, {"MAYA_THERMAL_ABORT_C": "200"},
+                    {"MAYA_THERMAL_GPUS": "card0"}, {"MAYA_THERMAL_EVERY_S": "0.1"}):
             with self.assertRaises(ValueError):
                 TH.settings(bad)
+
+    def test_settings_by_either_name(self):
+        # MAYA_* (as tools/maya-serve.sh and the docs set them, and a config's "env" after env_in), the older
+        # STRATA_* still read; in one environment the MAYA_ name counts, across them the lowest limit
+        self.assertEqual(TH.settings({"STRATA_THERMAL_ABORT_C": "88"})[0], 88)
+        self.assertEqual(TH.settings({"MAYA_THERMAL_ABORT_C": "90", "STRATA_THERMAL_ABORT_C": "70"})[0], 90)
+        self.assertIsNone(TH.settings({"MAYA_THERMAL_ABORT_C": "0", "STRATA_THERMAL_ABORT_C": "70"})[0])
+        self.assertEqual(TH.settings({"MAYA_THERMAL_ABORT_C": "90"}, {"STRATA_THERMAL_ABORT_C": "85"})[0], 85)
+        self.assertEqual(TH.settings({"STRATA_THERMAL_ABORT_C": "90"}, {"MAYA_THERMAL_ABORT_C": "85"})[0], 85)
+        self.assertEqual(TH.settings({"STRATA_THERMAL_GPUS": "0000:6f:00.0", "STRATA_THERMAL_EVERY_S": "4"})[1:],
+                         ({"0000:6f:00"}, 4.0))
 
     def test_refusals(self):
         g = TH.Guard(90, root=str(self.hw))
@@ -169,17 +180,18 @@ print(json.dumps({"kids": [k.pid for k in kids], "grand": grand, "ended": ended,
         from serve import server as SV
         with mock.patch.object(TH, "HWMON", str(self.hw)):
             with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("MAYA_THERMAL_ABORT_C", None)
                 os.environ.pop("STRATA_THERMAL_ABORT_C", None)
                 self.assertIsNone(SV.thermal_guard({}))                         # off: nothing read
-                g = SV.thermal_guard({"env": {"STRATA_THERMAL_ABORT_C": "90"}})  # the config's
+                g = SV.thermal_guard({"env": {"MAYA_THERMAL_ABORT_C": "90"}})  # the config's
                 self.assertEqual(g.limit, 90)
-                os.environ["STRATA_THERMAL_ABORT_C"] = "80"                      # the environment's, lower
-                self.assertEqual(SV.thermal_guard({"env": {"STRATA_THERMAL_ABORT_C": "90"}}).limit, 80)
+                os.environ["MAYA_THERMAL_ABORT_C"] = "80"                      # the environment's, lower
+                self.assertEqual(SV.thermal_guard({"env": {"MAYA_THERMAL_ABORT_C": "90"}}).limit, 80)
                 set_temp(self.b, "edge", 85000)
                 with self.assertRaises(SystemExit) as e:
                     SV.thermal_guard({})
                 self.assertIn("not serving: a GPU already reads edge 85°C", str(e.exception))
-                os.environ["STRATA_THERMAL_ABORT_C"] = "hot"
+                os.environ["MAYA_THERMAL_ABORT_C"] = "hot"
                 with self.assertRaises(SystemExit):
                     SV.thermal_guard({})
 

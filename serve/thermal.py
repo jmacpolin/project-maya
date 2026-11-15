@@ -85,23 +85,31 @@ def hottest(rows, limit: float) -> str | None:
     return f"{label} {t:g}°C on {card}"
 
 
+def setting(env, name: str):
+    """`name` (THERMAL_ABORT_C ...) from one environment: MAYA_<name>, else the older STRATA_<name> - as
+    tools/maya_names.py reads every setting (since v1.1.57 the code reads MAYA_*, and a config's "env" comes in under
+    those names; os.environ gets MAYA_* from STRATA_*, not the other way round)."""
+    v = env.get("MAYA_" + name)
+    return env.get("STRATA_" + name) if v is None else v
+
+
 def settings(*envs) -> tuple:
     """(limit in °C or None when off, the cards to read or None for all, seconds between readings) from these
-    environments - os.environ first, then a config's "env" (under the names the code reads, STRATA_*): the lowest
+    environments - os.environ first, then a config's "env" (MAYA_* names, or the older STRATA_* ones): the lowest
     limit set counts, the other two are the first one set.  ValueError for a value that is none of these."""
     limits, only, every = [], None, None
     for env in envs:
-        v = str(env.get("STRATA_THERMAL_ABORT_C") or "").strip()
+        v = str(setting(env, "THERMAL_ABORT_C") or "").strip()
         if v.lower() not in OFF:
             if not re.fullmatch(r"\d+", v) or not 1 <= int(v) <= 150:
                 raise ValueError(f"MAYA_THERMAL_ABORT_C={v!r}: a whole number of °C from 1 to 150 (0 or unset: off)")
             limits.append(int(v))
-        g = str(env.get("STRATA_THERMAL_GPUS") or "").strip()
+        g = str(setting(env, "THERMAL_GPUS") or "").strip()
         if g and only is None:
             only = {pci(x) for x in g.split(",") if x.strip()}
             if None in only:
                 raise ValueError(f"MAYA_THERMAL_GPUS={g!r}: PCI addresses, e.g. 0000:6f:00.0,0000:72:00.0")
-        e = str(env.get("STRATA_THERMAL_EVERY_S") or "").strip()
+        e = str(setting(env, "THERMAL_EVERY_S") or "").strip()
         if e and every is None:
             try:
                 every = float(e)
